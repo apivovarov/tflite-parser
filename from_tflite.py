@@ -3,6 +3,7 @@
 import math
 import numpy as np
 import tflite.Model
+np.set_printoptions(threshold=1000000, linewidth=160)
 
 
 class TensorWrapper(object):
@@ -19,7 +20,7 @@ class OperatorConverter(object):
     is_const = True
 
     """OperatorConverter class which handles TFLite ops to Hexagon NN ops conversion"""
-    def __init__(self, model, subgraph, tensor_tab):
+    def __init__(self, model, subgraph):
 
         try:
             from tflite.BuiltinOperator import BuiltinOperator
@@ -30,9 +31,11 @@ class OperatorConverter(object):
 
         self.model = model
         self.subgraph = subgraph
-        self.tensor_tab = tensor_tab
+        self.tensor_tab = {}
         self.stride_tab = {}
         self.float_tab = {}
+        self.const_nodes = []
+        self.nodes = []
         self.builtin_op_code = build_str_map(BuiltinOperator())
         self.activation_fn_type = build_str_map(ActivationFunctionType())
         self.builtin_options = build_str_map(BuiltinOptions())
@@ -43,12 +46,24 @@ class OperatorConverter(object):
             'DEPTHWISE_CONV_2D': self.convert_depthwise_conv2d,
         }
 
-    def nn_float(self, v):
+    def nn_float(self, v, dtype):
         key = v
         if key in self.float_tab:
             print("Float, already exist:", self.float_tab[key])
             return self.float_tab[key]
         self.const_node_id += 1
+        n_id = self.const_node_id
+        ctype, type_bytes = dtype
+
+        print("static {} data_for_op_{}[1] ALIGNED = {{".format(ctype, n_id))
+        print("", v)
+        print("}")
+        print("")
+
+        self.const_nodes.append("APPEND_CONST_NODE({},1,1,1,1,(const uint8_t*)data_for_op_{},{});".format(
+            n_id, n_id, type_bytes
+        ))
+
         print("Added Float, id:", self.const_node_id, ", v:", v)
         out_nodes = [(self.const_node_id, 0)]
         self.float_tab[key] = out_nodes
@@ -60,6 +75,11 @@ class OperatorConverter(object):
             print("Stride, already exist:", self.stride_tab[key])
             return self.stride_tab[key]
         self.const_node_id += 1
+        n_id = self.const_node_id
+
+        self.const_nodes.append("APPEND_CONST_NODE({},1,{},{},1,(const uint8_t*)NULL,0);".format(
+            n_id, h, w
+        ))
         print("Added Stride, id:", self.const_node_id, ", h:", h, ", w:", w)
         out_nodes = [(self.const_node_id, 0)]
         self.stride_tab[key] = out_nodes
@@ -67,7 +87,32 @@ class OperatorConverter(object):
 
 
     def nn_new_const(self, tensor_id, val, dtype):
+        if tensor_id in self.tensor_tab:
+            print("Constant, already exist:", self.tensor_id[tensor_id])
+            return self.tensor_id[tensor_id]
         self.const_node_id += 1
+        n_id = self.const_node_id
+        ctype, type_bytes = dtype
+
+        ndim = len(val.shape)
+        flat_v = val.flatten()
+        assert ndim in [1,4], "Constant Value Shape should be 1 or 4"
+        if ndim == 4:
+          n, h, w, c = val.shape
+        elif ndim == 1:
+          n, h, w, c = 1, 1, 1, flat_v.size
+
+        sz_bytes = type_bytes * flat_v.size
+
+        print("static {} data_for_op_{}[{}] ALIGNED = {{".format(ctype, n_id, flat_v.size))
+        print("", np.array2string(flat_v, separator=",")[1:-1])
+        print("}")
+        print("")
+
+        self.const_nodes.append("APPEND_CONST_NODE({},{},{},{},{},(const uint8_t*)data_for_op_{},{});".format(
+            n_id, n,h,w,c, n_id, sz_bytes
+        ))
+
         print("Added Constant, id:", self.const_node_id, ", type:", dtype, ", len:", len(val), ", tensor_id:", tensor_id)
         out_nodes = [(self.const_node_id, 0)]
         self.tensor_tab[tensor_id] = out_nodes
@@ -107,7 +152,7 @@ class OperatorConverter(object):
         self.node_id += 1
         from tflite.ActivationFunctionType import ActivationFunctionType
         if fused_activation_fn == ActivationFunctionType.RELU6:
-            threshold_nodes = self.nn_float(6.0)
+            threshold_nodes = self.nn_float(6.0, ("float", 4))
             print("Relu6. id:", self.node_id, ", data_id: ", data_id, ", threshold_nodes:", threshold_nodes)
         elif fused_activation_fn == ActivationFunctionType.RELU:
             print("Relu. id:", self.node_id, ", data_id: ", data_id)
@@ -137,7 +182,7 @@ class OperatorConverter(object):
             tensor = self.get_tensors([tensor_id])[0]
             if tensor.buffer.DataIsNone():
                 continue
-            tensor_type_str = self.get_tensor_type_str(tensor.tensor.Type())
+            tensor_type_str = self.get_c_type(tensor.tensor.Type())
             self.nn_new_const(tensor_id, self.get_tensor_value(tensor),
                               dtype=tensor_type_str)
 
@@ -231,7 +276,7 @@ class OperatorConverter(object):
         raise NotImplementedError("Tensor type {} is currently not supported"
                                   .format(str(tensor_wrapper.tensor.Type())))
 
-    def get_tensor_type_str(self, tensor_type):
+    def get_c_type(self, tensor_type):
         """Get tensor type string representation when given TFLite tensor type"""
         try:
             from tflite.TensorType import TensorType
@@ -239,13 +284,11 @@ class OperatorConverter(object):
             raise ImportError("The tflite package must be installed")
 
         if tensor_type == TensorType.UINT8:
-            return "uint8"
+            return ("uint8_t", 1)
         if tensor_type == TensorType.FLOAT32:
-            return "float32"
+            return ("float", 4)
         if tensor_type == TensorType.INT32:
-            return "int32"
-        if tensor_type == TensorType.INT64:
-            return "int64"
+            return ("int32_t", 4)
         raise NotImplementedError("Tensor type {} is currently not supported"
                                   .format(str(tensor_type)))
 
@@ -325,12 +368,12 @@ class OperatorConverter(object):
             # RELU6 consts value
             fused_activation_fn = conv_options.FusedActivationFunction()
             if fused_activation_fn == ActivationFunctionType.RELU6:
-                self.nn_float(6.0)
+                self.nn_float(6.0, ("float", 4))
 
             # weight tensor type should be UINT8 (quantization) or FLOAT32
             weight_tensor_type = weight_tensor.tensor.Type()
             assert weight_tensor_type in (TensorType.UINT8, TensorType.FLOAT32)
-            weight_tensor_type_str = self.get_tensor_type_str(weight_tensor_type)
+            weight_tensor_type_str = self.get_c_type(weight_tensor_type)
 
             # in_expr = self.get_expr(input_tensor_idx)
             weight_value = self.get_tensor_value(weight_tensor)
@@ -350,7 +393,7 @@ class OperatorConverter(object):
                 bias_tensor_type = bias_tensor.tensor.Type()
                 # bias tensor type should be INT32 (quantization) or FLOAT32
                 assert bias_tensor_type in (TensorType.INT32, TensorType.FLOAT32)
-                bias_tensor_type_str = self.get_tensor_type_str(bias_tensor_type)
+                bias_tensor_type_str = self.get_c_type(bias_tensor_type)
                 self.nn_new_const(bias_tensor_idx, self.get_tensor_value(bias_tensor),
                                  dtype=bias_tensor_type_str)
             return
@@ -365,7 +408,7 @@ class OperatorConverter(object):
         output_tensor = output_tensors[0]
         output_tensor_idx = output_tensor.tensor_idx
         output_tensor_type = output_tensor.tensor.Type()
-        output_tensor_type_str = self.get_tensor_type_str(output_tensor_type)
+        output_tensor_type_str = self.get_c_type(output_tensor_type)
 
         is_depthwise_conv = False
         if conv_type == 'conv2d':
@@ -522,7 +565,6 @@ def from_tflite(model): #, shape_dict, dtype_dict):
     model_inputs = subgraph.InputsAsNumpy()
     model_outputs = subgraph.OutputsAsNumpy()
 
-    tensor_tab = {}
     #for model_input in model_inputs:
     #     nn_add_input(model_input)
     #     model_input_name = get_tensor_name(subgraph, model_input)
@@ -531,7 +573,7 @@ def from_tflite(model): #, shape_dict, dtype_dict):
     #     #exp_tab.set_expr(model_input_name, _expr.var(model_input_name, shape=shape, dtype=dtype))
 
     # op code in model
-    op_converter = OperatorConverter(model, subgraph, tensor_tab)
+    op_converter = OperatorConverter(model, subgraph)
     op_converter.check_unsupported_ops()
 
     op_converter.is_const = True
@@ -546,7 +588,9 @@ def from_tflite(model): #, shape_dict, dtype_dict):
     for model_output in model_outputs:
           op_converter.nn_add_output(model_output)
 
-    print(tensor_tab)
+    print(op_converter.tensor_tab)
+
+    print(op_converter.const_nodes)
 
     # params and outputs
     # params = {k:_nd.array(np.array(v)) for k, v in exp_tab.params.items()}
