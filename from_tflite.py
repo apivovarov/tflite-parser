@@ -8,10 +8,11 @@ np.set_printoptions(threshold=1000000, linewidth=160)
 
 class TensorWrapper(object):
     """Tensor wrapper for TFLite Tensor"""
-    def __init__(self, tensor_idx, tensor, buffer, qnn_params=None):
+    def __init__(self, tensor_idx, tensor, buffer, c_type, qnn_params=None):
         self.tensor_idx = tensor_idx
         self.tensor = tensor
         self.buffer = buffer
+        self.c_type = c_type
         self.qnn_params = qnn_params
 
 class OperatorConverter(object):
@@ -46,25 +47,25 @@ class OperatorConverter(object):
             'DEPTHWISE_CONV_2D': self.convert_depthwise_conv2d,
         }
 
-    def nn_float(self, v, dtype):
+    def nn_scalar(self, v, c_type):
         key = v
         if key in self.float_tab:
             print("Float, already exist:", self.float_tab[key])
             return self.float_tab[key]
         self.const_node_id += 1
         n_id = self.const_node_id
-        ctype, type_bytes = dtype
+        ctype, type_bytes = c_type
 
         print("static {} data_for_op_{}[1] ALIGNED = {{".format(ctype, n_id))
         print("", v)
-        print("}")
+        print("};")
         print("")
 
         self.const_nodes.append("APPEND_CONST_NODE({},1,1,1,1,(const uint8_t*)data_for_op_{},{});".format(
             n_id, n_id, type_bytes
         ))
 
-        print("Added Float, id:", self.const_node_id, ", v:", v)
+        print("Added Number, id:", self.const_node_id, ", v:", v)
         out_nodes = [(self.const_node_id, 0)]
         self.float_tab[key] = out_nodes
         return out_nodes
@@ -86,13 +87,14 @@ class OperatorConverter(object):
         return out_nodes
 
 
-    def nn_new_const(self, tensor_id, val, dtype):
+    def nn_new_const(self, tensor, val):
+        tensor_id = tensor.tensor_idx
         if tensor_id in self.tensor_tab:
             print("Constant, already exist:", self.tensor_id[tensor_id])
             return self.tensor_id[tensor_id]
         self.const_node_id += 1
         n_id = self.const_node_id
-        ctype, type_bytes = dtype
+        ctype, type_bytes = tensor.c_type
 
         ndim = len(val.shape)
         flat_v = val.flatten()
@@ -106,58 +108,141 @@ class OperatorConverter(object):
 
         print("static {} data_for_op_{}[{}] ALIGNED = {{".format(ctype, n_id, flat_v.size))
         print("", np.array2string(flat_v, separator=",")[1:-1])
-        print("}")
+        print("};")
         print("")
 
         self.const_nodes.append("APPEND_CONST_NODE({},{},{},{},{},(const uint8_t*)data_for_op_{},{});".format(
             n_id, n,h,w,c, n_id, sz_bytes
         ))
 
-        print("Added Constant, id:", self.const_node_id, ", type:", dtype, ", len:", len(val), ", tensor_id:", tensor_id)
+        print("Added Constant, id:", self.const_node_id, ", type:", ctype, ", len:", len(val), ", tensor_id:", tensor_id)
         out_nodes = [(self.const_node_id, 0)]
         self.tensor_tab[tensor_id] = out_nodes
         return out_nodes
 
-    def nn_add_input(self, tensor_id):
+    def nn_add_input(self, tensor):
         self.node_id += 1
+        n_id = self.node_id
+        tensor_id = tensor.tensor_idx
+        n,h,w,c = tensor.tensor.ShapeAsNumpy()
+        _, type_bytes = tensor.c_type
+
+        print("// INPUT")
         # prep_input_arr - empty
+        print("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        print("};")
         # prep_output_arr - shape + dtype
+        print("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        print("    OUTPUT_4D({},{},{},{},{})".format(
+            n,h,w,c,type_bytes
+        ))
+        print("};")
+        print("")
+
+        self.nodes.append("APPEND_NODE(""input"",{},OP_INPUT,NN_PAD_NA,inputs_for_{},0,outputs_for_{},1);".format(
+            n_id, n_id, n_id
+        ))
+
         print("Added input node, id:", self.node_id, "shape: , dtype: ", ", tensor_id:", tensor_id)
         out_nodes = [(self.node_id, 0)]
         self.tensor_tab[tensor_id] = out_nodes
         return out_nodes
 
-    def nn_add_output(self, tensor_id):
+    def nn_add_output(self, tensor):
+        tensor_id = tensor.tensor_idx
         if tensor_id not in self.tensor_tab:
             raise ValueError("Can not find tensor_id {} in tensor_tab".format(tensor_id))
         node = self.tensor_tab[tensor_id]
         self.node_id += 1
+        n_id = self.node_id
+        n, h, w, c = tensor.tensor.ShapeAsNumpy()
+        _, type_bytes = tensor.c_type
         # prep_input_arr - [node]
+        print("// OUTPUT")
+        print("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        print("    OUTPUT_4D({},{},{},{},{})".format(
+            n, h, w, c, type_bytes
+        ))
+        print("};")
         # prep_output_arr - empty
+        print("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        print("};")
+        print("")
+
+        self.nodes.append("APPEND_NODE(""output"",{},OP_OUTPUT,NN_PAD_NA,inputs_for_{},1,outputs_for_{},0);".format(
+            n_id, n_id, n_id
+        ))
+
         print("Added output node, id:", self.node_id, ", node: ", node)
 
-    def nn_bias_add(self, data_id, bias_nodes):
+    def nn_bias_add(self, data_nodes, bias_nodes, data_shape):
         self.node_id += 1
-        print("bias_add. id: ", self.node_id, ", data_id: ", data_id, ", bias_nodes:", bias_nodes)
+        n_id = self.const_node_id
+        # prep_input_arr
+        print("// Bias_add")
+        print("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        print("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[0][0], data_nodes[0][1]))
+        print("    {{ .src_id = {}, .output_idx = {}, }},".format(bias_nodes[0][0], bias_nodes[0][1]))
+        if len(data_nodes) == 3 and len(bias_nodes) == 3:
+            print("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[1][0], data_nodes[1][1]))
+            print("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[2][0], data_nodes[2][1]))
+            print("    {{ .src_id = {}, .output_idx = {}, }},".format(bias_nodes[1][0], bias_nodes[1][1]))
+            print("    {{ .src_id = {}, .output_idx = {}, }},".format(bias_nodes[2][0], bias_nodes[2][1]))
+        print("};")
+        # prep_output_arr
+        n,h,w,c = data_shape
+        print("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        print("    OUTPUT_4D({},{},{},{},4),".format(n,h,w,c))
+        if len(data_nodes) == 3 and len(bias_nodes) == 3:
+            print("    OUTPUT_4D(1,1,1,1,4),")
+            print("    OUTPUT_4D(1,1,1,1,4),")
+        print("};")
+        print("")
+        print("bias_add. id: ", self.node_id, ", data_id: ", data_nodes, ", bias_nodes:", bias_nodes)
         out_nodes = [(self.node_id, 0)]
         return out_nodes
 
     def nn_conv2d(self, data_nodes, weight_nodes, stride_nodes, params):
         self.node_id += 1
+        n_id = self.const_node_id
         print("nn_conv2d. id:", self.node_id ,", data_nodes: ", data_nodes, ", weight_nodes:", weight_nodes, "stride_nodes: ", stride_nodes, ", params:", params)
         out_nodes = [(self.node_id, 0)]
         return out_nodes
 
-    def nn_fused_activation(self, data_id, fused_activation_fn):
+    def nn_fused_activation(self, data_nodes, fused_activation_fn, data_shape, c_type):
         self.node_id += 1
+        n_id = self.const_node_id
         from tflite.ActivationFunctionType import ActivationFunctionType
         if fused_activation_fn == ActivationFunctionType.RELU6:
-            threshold_nodes = self.nn_float(6.0, ("float", 4))
-            print("Relu6. id:", self.node_id, ", data_id: ", data_id, ", threshold_nodes:", threshold_nodes)
+            threshold_node = self.nn_scalar(6.0, ("float", 4))[0]
+            print("Relu6. id:", self.node_id, ", data_id: ", data_nodes, ", threshold_node:", threshold_node)
         elif fused_activation_fn == ActivationFunctionType.RELU:
-            print("Relu. id:", self.node_id, ", data_id: ", data_id)
+            print("Relu. id:", self.node_id, ", data_id: ", data_nodes)
         else:
             raise ValueError("Activation function RELU_N1_TO_1, TAHN, SIGN_BIT are not supported")
+
+        # prep_input_arr
+        if fused_activation_fn == ActivationFunctionType.RELU6:
+            print("// RELU6")
+        else:
+            print("// RELU")
+        print("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        for data_node in data_nodes:
+            print("    {{ .src_id = {}, .output_idx = {}, }},".format(data_node[0], data_node[1]))
+        if threshold_node is not None:
+            print("    {{ .src_id = {}, .output_idx = {}, }},".format(threshold_node[0], threshold_node[1]))
+        print("};")
+
+        # prep_output_arr
+        n, h, w, c = data_shape
+        _, type_bytes = c_type
+        print("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        print("    OUTPUT_4D({},{},{},{},{}),".format(n, h, w, c, type_bytes))
+        if len(data_nodes) == 3:
+            print("    OUTPUT_4D(1,1,1,1,4),")
+            print("    OUTPUT_4D(1,1,1,1,4),")
+        print("};")
+        print("")
         out_nodes = [(self.node_id, 0)]
         return out_nodes
 
@@ -177,14 +262,6 @@ class OperatorConverter(object):
             ops = str(list(unsupported_ops_set)).strip('[,]')
             raise ValueError(msg.format(ops))
 
-    def convert_constants_to_hexagon_nn(self):
-        for tensor_id in range(self.subgraph.TensorsLength()):
-            tensor = self.get_tensors([tensor_id])[0]
-            if tensor.buffer.DataIsNone():
-                continue
-            tensor_type_str = self.get_c_type(tensor.tensor.Type())
-            self.nn_new_const(tensor_id, self.get_tensor_value(tensor),
-                              dtype=tensor_type_str)
 
     def convert_op_to_hexagon_nn(self):
         """Convert TFLite ops to hexagon_nn"""
@@ -237,6 +314,7 @@ class OperatorConverter(object):
             tensor = self.subgraph.Tensors(tensor_idx)
             buffer_idx = tensor.Buffer()
             buffer = self.model.Buffers(buffer_idx)
+            c_type = self.get_c_type(tensor.Type())
 
             # Check if the tensors are quantized. Parse if yes.
             qnn_params = None
@@ -249,7 +327,7 @@ class OperatorConverter(object):
                     qnn_params = dict()
                     qnn_params['scale'] = scale
                     qnn_params['zero_point'] = zero_point
-            return_list.append(TensorWrapper(tensor_idx, tensor, buffer, qnn_params))
+            return_list.append(TensorWrapper(tensor_idx, tensor, buffer, c_type, qnn_params))
         return return_list
 
     def get_tensor_value(self, tensor_wrapper):
@@ -368,12 +446,11 @@ class OperatorConverter(object):
             # RELU6 consts value
             fused_activation_fn = conv_options.FusedActivationFunction()
             if fused_activation_fn == ActivationFunctionType.RELU6:
-                self.nn_float(6.0, ("float", 4))
+                self.nn_scalar(6.0, ("float", 4))
 
             # weight tensor type should be UINT8 (quantization) or FLOAT32
             weight_tensor_type = weight_tensor.tensor.Type()
             assert weight_tensor_type in (TensorType.UINT8, TensorType.FLOAT32)
-            weight_tensor_type_str = self.get_c_type(weight_tensor_type)
 
             # in_expr = self.get_expr(input_tensor_idx)
             weight_value = self.get_tensor_value(weight_tensor)
@@ -385,17 +462,15 @@ class OperatorConverter(object):
             # 1 KH KW C(input_c * depth_multiplier), we require
             # KH KW IC M (depth_multiplier) (HWOI)
             weight_value = weight_value.transpose((1, 2, 3, 0))
-            self.nn_new_const(weight_tensor_idx, weight_value, dtype=weight_tensor_type_str)
+            self.nn_new_const(weight_tensor, weight_value)
 
             if len(input_tensors) == 3:
                 bias_tensor = input_tensors[2]
-                bias_tensor_idx = bias_tensor.tensor_idx
                 bias_tensor_type = bias_tensor.tensor.Type()
                 # bias tensor type should be INT32 (quantization) or FLOAT32
                 assert bias_tensor_type in (TensorType.INT32, TensorType.FLOAT32)
-                bias_tensor_type_str = self.get_c_type(bias_tensor_type)
-                self.nn_new_const(bias_tensor_idx, self.get_tensor_value(bias_tensor),
-                                 dtype=bias_tensor_type_str)
+                bias_value = self.get_tensor_value(bias_tensor)
+                self.nn_new_const(bias_tensor, bias_value)
             return
         # End of Constant nodes generation pass
 
@@ -407,8 +482,8 @@ class OperatorConverter(object):
         assert len(output_tensors) == 1, "output tensors length should be 1"
         output_tensor = output_tensors[0]
         output_tensor_idx = output_tensor.tensor_idx
-        output_tensor_type = output_tensor.tensor.Type()
-        output_tensor_type_str = self.get_c_type(output_tensor_type)
+        output_tensor_shape = output_tensor.tensor.ShapeAsNumpy()
+        output_tensor_c_type = output_tensor.c_type
 
         is_depthwise_conv = False
         if conv_type == 'conv2d':
@@ -483,11 +558,12 @@ class OperatorConverter(object):
             bias_tensor = input_tensors[2]
             bias_tensor_idx = bias_tensor.tensor_idx
             bias_nodes = self.tensor_tab[bias_tensor_idx]
-            bias_out_nodes = self.nn_bias_add(conv_out_nodes, bias_nodes)
+            bias_out_nodes = self.nn_bias_add(conv_out_nodes, bias_nodes, output_tensor_shape)
             op_out_nodes = bias_out_nodes
         # If we have fused activations
         if fused_activation_fn != ActivationFunctionType.NONE:
-            fused_act_out_nodes = self.nn_fused_activation(bias_out_nodes, fused_activation_fn)
+            fused_act_out_nodes = self.nn_fused_activation(
+                op_out_nodes, fused_activation_fn, output_tensor_shape, output_tensor_c_type)
             op_out_nodes = fused_act_out_nodes
 
         self.tensor_tab[output_tensor_idx] = op_out_nodes
@@ -579,18 +655,24 @@ def from_tflite(model): #, shape_dict, dtype_dict):
     op_converter.is_const = True
     op_converter.convert_op_to_hexagon_nn()
 
-    for model_input in model_inputs:
-          op_converter.nn_add_input(model_input)
+    for tensor_id in model_inputs:
+        tensor = op_converter.get_tensors([tensor_id])[0]
+        op_converter.nn_add_input(tensor)
 
     op_converter.is_const = False
     op_converter.convert_op_to_hexagon_nn()
 
-    for model_output in model_outputs:
-          op_converter.nn_add_output(model_output)
+    for tensor_id in model_outputs:
+        tensor = op_converter.get_tensors([tensor_id])[0]
+        op_converter.nn_add_output(tensor)
 
     print(op_converter.tensor_tab)
 
-    print(op_converter.const_nodes)
+    for node in op_converter.const_nodes:
+        print(node)
+
+    for node in op_converter.nodes:
+        print(node)
 
     # params and outputs
     # params = {k:_nd.array(np.array(v)) for k, v in exp_tab.params.items()}
