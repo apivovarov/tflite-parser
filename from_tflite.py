@@ -1,9 +1,12 @@
-
-"""Tensorflow lite frontend."""
-import math
+"""Tensorflow lite to hexagon_nn converter"""
 import numpy as np
 import tflite.Model
-np.set_printoptions(threshold=1000000, linewidth=160)
+from tflite.ActivationFunctionType import ActivationFunctionType
+from tflite.Padding import Padding
+import os
+import shutil
+
+np.set_printoptions(threshold=100000000, linewidth=160)
 
 
 class TensorWrapper(object):
@@ -21,7 +24,7 @@ class OperatorConverter(object):
     is_const = True
 
     """OperatorConverter class which handles TFLite ops to Hexagon NN ops conversion"""
-    def __init__(self, model, subgraph):
+    def __init__(self, model, subgraph, prog_name):
 
         try:
             from tflite.BuiltinOperator import BuiltinOperator
@@ -41,11 +44,38 @@ class OperatorConverter(object):
         self.activation_fn_type = build_str_map(ActivationFunctionType())
         self.builtin_options = build_str_map(BuiltinOptions())
 
+        h_file_name = '{}.h'.format(prog_name)
+        shutil.copy("header_templ.h", h_file_name)
+
+        self.h_file = open(h_file_name, 'a')
+
         # Add more operators
         self.convert_map = {
             'CONV_2D': self.convert_conv2d,
             'DEPTHWISE_CONV_2D': self.convert_depthwise_conv2d,
         }
+
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        self.h_file.close()
+
+    def h(self, *args):
+        print(*args, file=self.h_file)
+
+    def print_nn_nodes(self):
+        self.h("void append_const_nodes(nn_id) {")
+        for node in self.const_nodes:
+            self.h("   ", node)
+        self.h("}")
+        self.h("")
+
+        self.h("void append_nodes(nn_id) {")
+        for node in self.nodes:
+            self.h("   ", node)
+        self.h("}")
+        self.h("")
 
     def nn_scalar(self, v, c_type):
         key = v
@@ -56,10 +86,10 @@ class OperatorConverter(object):
         n_id = self.const_node_id
         ctype, type_bytes = c_type
 
-        print("static {} data_for_op_{}[1] ALIGNED = {{".format(ctype, n_id))
-        print("", v)
-        print("};")
-        print("")
+        self.h("static {} data_for_op_{}[1] ALIGNED = {{".format(ctype, n_id))
+        self.h("", v)
+        self.h("};")
+        self.h("")
 
         self.const_nodes.append("APPEND_CONST_NODE({},1,1,1,1,(const uint8_t*)data_for_op_{},{});".format(
             n_id, n_id, type_bytes
@@ -106,10 +136,10 @@ class OperatorConverter(object):
 
         sz_bytes = type_bytes * flat_v.size
 
-        print("static {} data_for_op_{}[{}] ALIGNED = {{".format(ctype, n_id, flat_v.size))
-        print("", np.array2string(flat_v, separator=",")[1:-1])
-        print("};")
-        print("")
+        self.h("static {} data_for_op_{}[{}] ALIGNED = {{".format(ctype, n_id, flat_v.size))
+        self.h("", np.array2string(flat_v, separator=",")[1:-1])
+        self.h("};")
+        self.h("")
 
         self.const_nodes.append("APPEND_CONST_NODE({},{},{},{},{},(const uint8_t*)data_for_op_{},{});".format(
             n_id, n,h,w,c, n_id, sz_bytes
@@ -120,6 +150,20 @@ class OperatorConverter(object):
         self.tensor_tab[tensor_id] = out_nodes
         return out_nodes
 
+    def define_model_sizes(self, prefix, tensor):
+        n,h,w,c = tensor.tensor.ShapeAsNumpy()
+        _, type_bytes = tensor.c_type
+
+        self.h("//", prefix, "SIZE")
+        self.h("#define {}_BATCH {}".format(prefix, n))
+        self.h("#define {}_HEIGHT {}".format(prefix, h))
+        self.h("#define {}_WIDTH {}".format(prefix, w))
+        self.h("#define {}_DEPTH {}".format(prefix, c))
+        self.h("#define {p}_LEN ({p}_BATCH * {p}_HEIGHT * {p}_WIDTH * {p}_DEPTH)".format(p=prefix))
+        self.h("#define {}_ELEMENTSIZE {}".format(prefix, type_bytes))
+        self.h("#define {p}_SIZE ({p}_LEN * {p}_ELEMENTSIZE)".format(p=prefix))
+        self.h("")
+
     def nn_add_input(self, tensor):
         self.node_id += 1
         n_id = self.node_id
@@ -127,19 +171,19 @@ class OperatorConverter(object):
         n,h,w,c = tensor.tensor.ShapeAsNumpy()
         _, type_bytes = tensor.c_type
 
-        print("// INPUT")
+        self.h("// INPUT")
         # prep_input_arr - empty
-        print("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
-        print("};")
+        self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        self.h("};")
         # prep_output_arr - shape + dtype
-        print("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
-        print("    OUTPUT_4D({},{},{},{},{})".format(
+        self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        self.h("    OUTPUT_4D({},{},{},{},{}),".format(
             n,h,w,c,type_bytes
         ))
-        print("};")
-        print("")
+        self.h("};")
+        self.h("")
 
-        self.nodes.append("APPEND_NODE(""input"",{},OP_INPUT,NN_PAD_NA,inputs_for_{},0,outputs_for_{},1);".format(
+        self.nodes.append("APPEND_NODE(\"input\",{},OP_INPUT,NN_PAD_NA,inputs_for_{},0,outputs_for_{},1);".format(
             n_id, n_id, n_id
         ))
 
@@ -148,71 +192,126 @@ class OperatorConverter(object):
         self.tensor_tab[tensor_id] = out_nodes
         return out_nodes
 
-    def nn_add_output(self, tensor):
-        tensor_id = tensor.tensor_idx
-        if tensor_id not in self.tensor_tab:
-            raise ValueError("Can not find tensor_id {} in tensor_tab".format(tensor_id))
-        node = self.tensor_tab[tensor_id]
+    def nn_add_output(self, data_nodes):
         self.node_id += 1
         n_id = self.node_id
-        n, h, w, c = tensor.tensor.ShapeAsNumpy()
-        _, type_bytes = tensor.c_type
+        assert len(data_nodes) == 1, "OUTPUT length should be 1"
         # prep_input_arr - [node]
-        print("// OUTPUT")
-        print("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
-        print("    OUTPUT_4D({},{},{},{},{})".format(
-            n, h, w, c, type_bytes
-        ))
-        print("};")
+        self.h("// OUTPUT")
+        self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[0][0], data_nodes[0][1]))
+        self.h("};")
         # prep_output_arr - empty
-        print("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
-        print("};")
-        print("")
+        self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        self.h("};")
+        self.h("")
 
-        self.nodes.append("APPEND_NODE(""output"",{},OP_OUTPUT,NN_PAD_NA,inputs_for_{},1,outputs_for_{},0);".format(
-            n_id, n_id, n_id
-        ))
+        self.nodes.append(
+            "APPEND_NODE(\"output\",{nid},OP_OUTPUT,NN_PAD_NA,inputs_for_{nid},1,outputs_for_{nid},0);"
+            .format(nid=n_id)
+        )
 
-        print("Added output node, id:", self.node_id, ", node: ", node)
+        print("Added output node, id:", self.node_id, ", node: ", data_nodes[0])
 
     def nn_bias_add(self, data_nodes, bias_nodes, data_shape):
         self.node_id += 1
-        n_id = self.const_node_id
+        n_id = self.node_id
+        is_quant = len(data_nodes) == 3 and len(bias_nodes) == 3
         # prep_input_arr
-        print("// Bias_add")
-        print("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
-        print("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[0][0], data_nodes[0][1]))
-        print("    {{ .src_id = {}, .output_idx = {}, }},".format(bias_nodes[0][0], bias_nodes[0][1]))
-        if len(data_nodes) == 3 and len(bias_nodes) == 3:
-            print("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[1][0], data_nodes[1][1]))
-            print("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[2][0], data_nodes[2][1]))
-            print("    {{ .src_id = {}, .output_idx = {}, }},".format(bias_nodes[1][0], bias_nodes[1][1]))
-            print("    {{ .src_id = {}, .output_idx = {}, }},".format(bias_nodes[2][0], bias_nodes[2][1]))
-        print("};")
+        self.h("// Bias_add")
+        self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[0][0], data_nodes[0][1]))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(bias_nodes[0][0], bias_nodes[0][1]))
+        if is_quant:
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[1][0], data_nodes[1][1]))
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[2][0], data_nodes[2][1]))
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(bias_nodes[1][0], bias_nodes[1][1]))
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(bias_nodes[2][0], bias_nodes[2][1]))
+        self.h("};")
         # prep_output_arr
         n,h,w,c = data_shape
-        print("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
-        print("    OUTPUT_4D({},{},{},{},4),".format(n,h,w,c))
-        if len(data_nodes) == 3 and len(bias_nodes) == 3:
-            print("    OUTPUT_4D(1,1,1,1,4),")
-            print("    OUTPUT_4D(1,1,1,1,4),")
-        print("};")
-        print("")
+        self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        self.h("    OUTPUT_4D({},{},{},{},4),".format(n,h,w,c))
+        if is_quant:
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+        self.h("};")
+        self.h("")
+
+        in_len, out_len = 2, 1
+        f_name = "OP_BiasAdd_f"
+        if is_quant:
+            in_len, out_len = 6, 3
+            f_name = "OP_QuantizedBiasAdd_32p32to32"
+
+        self.nodes.append(
+            "APPEND_NODE(\"bias\",{nid},{f_name},NN_PAD_NA,inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
+            .format(nid=n_id, f_name=f_name, in_len=in_len, out_len=out_len)
+        )
+
         print("bias_add. id: ", self.node_id, ", data_id: ", data_nodes, ", bias_nodes:", bias_nodes)
         out_nodes = [(self.node_id, 0)]
         return out_nodes
 
-    def nn_conv2d(self, data_nodes, weight_nodes, stride_nodes, params):
+    def nn_conv2d(self, data_nodes, weight_nodes, stride_nodes, conv_options, output_shape, is_dw):
         self.node_id += 1
-        n_id = self.const_node_id
-        print("nn_conv2d. id:", self.node_id ,", data_nodes: ", data_nodes, ", weight_nodes:", weight_nodes, "stride_nodes: ", stride_nodes, ", params:", params)
+        n_id = self.node_id
+        is_quant = len(data_nodes) == 3
+
+        padding = "NN_PAD_VALID"
+        if conv_options.Padding() == Padding.SAME:
+            padding = "NN_PAD_SAME"
+
+        op_name = "OP_Conv2d_f"
+        n_name = "conv2d"
+        in_len, out_len = 3, 1
+        if is_dw:
+            op_name = "OP_DepthwiseConv2d_f_ref"
+            n_name = "dw_conv2d"
+        if is_quant:
+            op_name = "OP_QuantizedConv2d_8x8to32"
+            n_name = "qconv2d"
+            in_len, out_len = 7, 3
+            if is_dw:
+                op_name = "OP_QuantizedDepthwiseConv2d_8x8to32"
+                n_name = "dw_qconv2d"
+
+        # prep_input_arr
+        self.h("//", n_name)
+        self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[0][0], data_nodes[0][1]))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(weight_nodes[0][0], weight_nodes[0][1]))
+        if is_quant:
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[1][0], data_nodes[1][1]))
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[2][0], data_nodes[2][1]))
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(weight_nodes[1][0], weight_nodes[1][1]))
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(weight_nodes[2][0], weight_nodes[2][1]))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(stride_nodes[0][0], stride_nodes[0][1]))
+        self.h("};")
+        # prep_output_arr
+        n, h, w, c = output_shape
+        self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        self.h("    OUTPUT_4D({},{},{},{},4),".format(n, h, w, c))
+        if is_quant:
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+        self.h("};")
+        self.h("")
+
+        self.nodes.append(
+            "APPEND_NODE(\"{n_name}\",{n_id},{op_name},{padding},inputs_for_{n_id},{in_len},outputs_for_{n_id},{out_len});".format(
+                n_name=n_name, n_id=n_id, op_name=op_name, padding=padding, in_len=in_len, out_len=out_len
+            )
+        )
+
+        print("nn_conv2d. id:", self.node_id ,", data_nodes: ", data_nodes, ", weight_nodes:", weight_nodes, "stride_nodes: ", stride_nodes)
         out_nodes = [(self.node_id, 0)]
         return out_nodes
 
     def nn_fused_activation(self, data_nodes, fused_activation_fn, data_shape, c_type):
         self.node_id += 1
-        n_id = self.const_node_id
-        from tflite.ActivationFunctionType import ActivationFunctionType
+        n_id = self.node_id
+        is_quant = len(data_nodes) == 3
         if fused_activation_fn == ActivationFunctionType.RELU6:
             threshold_node = self.nn_scalar(6.0, ("float", 4))[0]
             print("Relu6. id:", self.node_id, ", data_id: ", data_nodes, ", threshold_node:", threshold_node)
@@ -221,28 +320,48 @@ class OperatorConverter(object):
         else:
             raise ValueError("Activation function RELU_N1_TO_1, TAHN, SIGN_BIT are not supported")
 
+        in_len, out_len = 0, 0
         # prep_input_arr
         if fused_activation_fn == ActivationFunctionType.RELU6:
-            print("// RELU6")
+            self.h("// ReluX")
         else:
-            print("// RELU")
-        print("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+            self.h("// Relu")
+        self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
         for data_node in data_nodes:
-            print("    {{ .src_id = {}, .output_idx = {}, }},".format(data_node[0], data_node[1]))
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_node[0], data_node[1]))
+            in_len += 1
         if threshold_node is not None:
-            print("    {{ .src_id = {}, .output_idx = {}, }},".format(threshold_node[0], threshold_node[1]))
-        print("};")
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(threshold_node[0], threshold_node[1]))
+            in_len += 1
+        self.h("};")
 
         # prep_output_arr
         n, h, w, c = data_shape
         _, type_bytes = c_type
-        print("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
-        print("    OUTPUT_4D({},{},{},{},{}),".format(n, h, w, c, type_bytes))
+        self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        self.h("    OUTPUT_4D({},{},{},{},{}),".format(n, h, w, c, type_bytes))
+        out_len += 1
         if len(data_nodes) == 3:
-            print("    OUTPUT_4D(1,1,1,1,4),")
-            print("    OUTPUT_4D(1,1,1,1,4),")
-        print("};")
-        print("")
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+            out_len += 2
+        self.h("};")
+        self.h("")
+
+        f_name = "Relu"
+        if fused_activation_fn == ActivationFunctionType.RELU6:
+            f_name = "ReluX"
+        if is_quant:
+            f_name = "Quantized" + f_name + "_8"
+        else:
+            f_name = f_name + "_f"
+        f_name = "OP_" + f_name
+
+        self.nodes.append(
+            "APPEND_NODE(\"relu\",{nid},{f_name},NN_PAD_NA,inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
+            .format(nid=n_id, f_name=f_name, in_len=in_len, out_len=out_len)
+        )
+
         out_nodes = [(self.node_id, 0)]
         return out_nodes
 
@@ -272,13 +391,9 @@ class OperatorConverter(object):
 
             ret = self.convert_map[op_code_str](op)
 
-            # if len(output_tensors) == 1:
-            #     tensor_idx = output_tensors[0].tensor_idx
-            #     self.set_expr(get_tensor_name(self.subgraph, tensor_idx), ret)
-            # else:
-            #     for idx, output_tensor in enumerate(output_tensors):
-            #         self.set_expr(get_tensor_name(self.subgraph, output_tensor.tensor_idx),
-            #                               ret[idx])
+        assert len(output_tensors) == 1, "Last Operator should have one output tensor"
+        return ret
+
 
     def get_op_code_str(self, op):
         """Get TFLite ops string representation"""
@@ -485,14 +600,14 @@ class OperatorConverter(object):
         output_tensor_shape = output_tensor.tensor.ShapeAsNumpy()
         output_tensor_c_type = output_tensor.c_type
 
-        is_depthwise_conv = False
+        is_dw_conv = False
         if conv_type == 'conv2d':
             assert op.BuiltinOptionsType() == BuiltinOptions.Conv2DOptions
             op_options = op.BuiltinOptions()
             conv_options = Conv2DOptions()
             conv_options.Init(op_options.Bytes, op_options.Pos)
         elif conv_type == 'depthwise':
-            is_depthwise_conv = True
+            is_dw_conv = True
             assert op.BuiltinOptionsType() == BuiltinOptions.DepthwiseConv2DOptions
             op_options = op.BuiltinOptions()
             conv_options = DepthwiseConv2DOptions()
@@ -512,7 +627,7 @@ class OperatorConverter(object):
 
         _, input_h, input_w, input_c = input_tensor.tensor.ShapeAsNumpy()
 
-        if is_depthwise_conv:
+        if is_dw_conv:
             # TFLite depthwise convolution kernel layout is:
             # 1 KH KW C(input_c * depth_multiplier)
             _, kernel_h, kernel_w, in_channels = weight_tensor.tensor.ShapeAsNumpy()
@@ -526,16 +641,9 @@ class OperatorConverter(object):
         params = {'kernel_size': [kernel_h, kernel_w],
                   'strides': [stride_h, stride_w],
                   'dilation': [dilation_h, dilation_w],
-                  'padding': [0, 0],
+                  'padding': [0,0],
                   'data_layout': 'NHWC'}
 
-        if is_depthwise_conv:
-            params['channels'] = int(in_channels)
-            params['groups'] = int(in_channels)
-            params['kernel_layout'] = 'HWOI'
-        else:
-            params['channels'] = int(output_channels)
-            params['kernel_layout'] = 'HWIO'
 
 
         if input_tensor.qnn_params:
@@ -551,7 +659,8 @@ class OperatorConverter(object):
             raise ValueError("Can not find tensor_id {} in tensor_tab".format(input_tensor_idx))
         data_nodes = self.tensor_tab[input_tensor_idx]
         weight_nodes = self.tensor_tab[weight_tensor_idx]
-        conv_out_nodes = self.nn_conv2d(data_nodes, weight_nodes, stride_nodes, params)
+        conv_out_nodes = self.nn_conv2d(
+            data_nodes, weight_nodes, stride_nodes, conv_options, output_tensor_shape, is_dw_conv)
         op_out_nodes = conv_out_nodes
         # if we have bias
         if len(input_tensors) == 3:
@@ -610,7 +719,7 @@ def get_tensor_name(subgraph, tensor_idx):
     return subgraph.Tensors(tensor_idx).Name().decode("utf-8")
 
 
-def from_tflite(model): #, shape_dict, dtype_dict):
+def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
     """Convert from tflite model to Hexagon NN C program.
 
     Parameters
@@ -640,6 +749,8 @@ def from_tflite(model): #, shape_dict, dtype_dict):
     # model inputs / outputs
     model_inputs = subgraph.InputsAsNumpy()
     model_outputs = subgraph.OutputsAsNumpy()
+    assert model_inputs.size == 1, "Model should have only one input"
+    assert model_outputs.size == 1, "Model should have only one output"
 
     #for model_input in model_inputs:
     #     nn_add_input(model_input)
@@ -649,42 +760,40 @@ def from_tflite(model): #, shape_dict, dtype_dict):
     #     #exp_tab.set_expr(model_input_name, _expr.var(model_input_name, shape=shape, dtype=dtype))
 
     # op code in model
-    op_converter = OperatorConverter(model, subgraph)
+    op_converter = OperatorConverter(model, subgraph, prog_name)
     op_converter.check_unsupported_ops()
+
+    in_tensor = op_converter.get_tensors(model_inputs)[0]
+    out_tensor = op_converter.get_tensors(model_outputs)[0]
+
+    op_converter.define_model_sizes("IN", in_tensor)
+    op_converter.define_model_sizes("OUT", out_tensor)
 
     op_converter.is_const = True
     op_converter.convert_op_to_hexagon_nn()
 
-    for tensor_id in model_inputs:
-        tensor = op_converter.get_tensors([tensor_id])[0]
-        op_converter.nn_add_input(tensor)
+    op_converter.nn_add_input(in_tensor)
 
     op_converter.is_const = False
-    op_converter.convert_op_to_hexagon_nn()
+    output_nodes = op_converter.convert_op_to_hexagon_nn()
 
-    for tensor_id in model_outputs:
-        tensor = op_converter.get_tensors([tensor_id])[0]
-        op_converter.nn_add_output(tensor)
+    op_converter.nn_add_output(output_nodes)
 
+    op_converter.print_nn_nodes()
+
+    print("tensor_tab:")
     print(op_converter.tensor_tab)
 
-    for node in op_converter.const_nodes:
-        print(node)
+    op_converter.close()
 
-    for node in op_converter.nodes:
-        print(node)
 
-    # params and outputs
-    # params = {k:_nd.array(np.array(v)) for k, v in exp_tab.params.items()}
-    # outputs = [exp_tab.get_expr(get_tensor_name(subgraph, i)) for i in model_outputs]
-    # outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
-    # func = _expr.Function(analysis.free_vars(outputs), outputs)
-    # mod = _module.Module.from_expr(func)
-    # return mod, params
+def main():
+    tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224_conv0.tflite")
+    tflite_model_buf = open(tflite_model_file, "rb").read()
+    model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
+    prog_name = "mn2"
+    from_tflite(model, prog_name)
 
-import os
 
-tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224_conv1.tflite")
-tflite_model_buf = open(tflite_model_file, "rb").read()
-model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
-from_tflite(model)
+if __name__== "__main__":
+    main()
