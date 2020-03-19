@@ -53,6 +53,7 @@ class OperatorConverter(object):
         self.convert_map = {
             'CONV_2D': self.convert_conv2d,
             'DEPTHWISE_CONV_2D': self.convert_depthwise_conv2d,
+            'RESHAPE': self.convert_reshape,
         }
 
     def __del__(self):
@@ -76,6 +77,21 @@ class OperatorConverter(object):
             self.h("   ", node)
         self.h("}")
         self.h("")
+
+    def get_min_max(self, tensor):
+        ctype, type_bytes = tensor.c_type
+        qnn_params = tensor.tensor.Quantization()
+        assert qnn_params is not None, "qnn_params is None"
+        scale = float(qnn_params.ScaleAsNumpy())
+        zero_point = int(qnn_params.ZeroPointAsNumpy())
+        is_uint8 = ctype == "uint8_t"
+        if is_uint8:
+            min_v = -zero_point * scale
+            max_v = (255 - zero_point) * scale
+        else:
+            max_v = 2147483647 * scale
+            min_v = -max_v
+        return min_v, max_v
 
     def nn_scalar(self, v, c_type):
         key = v
@@ -116,7 +132,6 @@ class OperatorConverter(object):
         self.stride_tab[key] = out_nodes
         return out_nodes
 
-
     def nn_new_const(self, tensor, val):
         tensor_id = tensor.tensor_idx
         if tensor_id in self.tensor_tab:
@@ -125,6 +140,9 @@ class OperatorConverter(object):
         self.const_node_id += 1
         n_id = self.const_node_id
         ctype, type_bytes = tensor.c_type
+        is_quant = ctype != "float"
+        if is_quant:
+          min_v, max_v = self.get_min_max(tensor)
 
         ndim = len(val.shape)
         flat_v = val.flatten()
@@ -136,6 +154,7 @@ class OperatorConverter(object):
 
         sz_bytes = type_bytes * flat_v.size
 
+        # Data
         self.h("static {} data_for_op_{}[{}] ALIGNED = {{".format(ctype, n_id, flat_v.size))
         self.h("", np.array2string(flat_v, separator=",")[1:-1])
         self.h("};")
@@ -144,9 +163,14 @@ class OperatorConverter(object):
         self.const_nodes.append("APPEND_CONST_NODE({},{},{},{},{},(const uint8_t*)data_for_op_{},{});".format(
             n_id, n,h,w,c, n_id, sz_bytes
         ))
-
         print("Added Constant, id:", self.const_node_id, ", type:", ctype, ", len:", len(val), ", tensor_id:", tensor_id)
         out_nodes = [(self.const_node_id, 0)]
+
+        if is_quant:
+            # Min, Max
+            out_nodes += self.nn_scalar(min_v, ("float", 4))
+            out_nodes += self.nn_scalar(max_v, ("float", 4))
+
         self.tensor_tab[tensor_id] = out_nodes
         return out_nodes
 
@@ -169,7 +193,10 @@ class OperatorConverter(object):
         n_id = self.node_id
         tensor_id = tensor.tensor_idx
         n,h,w,c = tensor.tensor.ShapeAsNumpy()
-        _, type_bytes = tensor.c_type
+        ctype, type_bytes = tensor.c_type
+        is_quant = ctype != "float"
+        if is_quant:
+            min_v, max_v = self.get_min_max(tensor)
 
         self.h("// INPUT")
         # prep_input_arr - empty
@@ -189,13 +216,19 @@ class OperatorConverter(object):
 
         print("Added input node, id:", self.node_id, "shape: , dtype: ", ", tensor_id:", tensor_id)
         out_nodes = [(self.node_id, 0)]
+
+        if is_quant:
+            # Min, Max
+            out_nodes += self.nn_scalar(min_v, ("float", 4))
+            out_nodes += self.nn_scalar(max_v, ("float", 4))
+
         self.tensor_tab[tensor_id] = out_nodes
         return out_nodes
 
     def nn_add_output(self, data_nodes):
         self.node_id += 1
         n_id = self.node_id
-        assert len(data_nodes) == 1, "OUTPUT length should be 1"
+        #assert len(data_nodes) == 1, "OUTPUT length should be 1"
         # prep_input_arr - [node]
         self.h("// OUTPUT")
         self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
@@ -250,7 +283,7 @@ class OperatorConverter(object):
         )
 
         print("bias_add. id: ", self.node_id, ", data_id: ", data_nodes, ", bias_nodes:", bias_nodes)
-        out_nodes = [(self.node_id, 0)]
+        out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
 
     def nn_conv2d(self, data_nodes, weight_nodes, stride_nodes, conv_options, output_shape, is_dw):
@@ -305,7 +338,7 @@ class OperatorConverter(object):
         )
 
         print("nn_conv2d. id:", self.node_id ,", data_nodes: ", data_nodes, ", weight_nodes:", weight_nodes, "stride_nodes: ", stride_nodes)
-        out_nodes = [(self.node_id, 0)]
+        out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
 
     def nn_fused_activation(self, data_nodes, fused_activation_fn, data_shape, c_type):
@@ -362,8 +395,53 @@ class OperatorConverter(object):
             .format(nid=n_id, f_name=f_name, in_len=in_len, out_len=out_len)
         )
 
-        out_nodes = [(self.node_id, 0)]
+        out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
+
+    def nn_reshape(self, data_nodes, data_shape, target_shape):
+        if data_shape[-1] == target_shape[-1]:
+            print("Skip reshape")
+            return data_nodes
+        raise ValueError("Reshape is not implemented yet")
+
+    def nn_softmax(self, data_nodes, data_shape, c_type):
+        self.node_id += 1
+        n_id = self.node_id
+        is_quant = len(data_nodes) == 3
+
+        in_len, out_len = 0, 0
+        # prep_input_arr
+        self.h("// Softmax")
+        self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        for data_node in data_nodes:
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_node[0], data_node[1]))
+            in_len += 1
+        self.h("};")
+
+        # prep_output_arr
+        n, h, w, c = data_shape
+        _, type_bytes = c_type
+        self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        self.h("    OUTPUT_4D({},{},{},{},{}),".format(n, h, w, c, type_bytes))
+        out_len += 1
+        if is_quant:
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+            out_len += 2
+        self.h("};")
+        self.h("")
+
+        f_name = "OP_Softmax_f"
+        if is_quant:
+            f_name = "OP_QuantizedSoftmax_8"
+
+        self.nodes.append(
+            "APPEND_NODE(\"softmax\",{nid},{f_name},NN_PAD_NA,inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
+            .format(nid=n_id, f_name=f_name, in_len=in_len, out_len=out_len)
+        )
+        out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
+        return out_nodes
+
 
     def check_unsupported_ops(self):
         """Check unsupported TFLite ops in our converter."""
@@ -435,13 +513,18 @@ class OperatorConverter(object):
             qnn_params = None
             tflite_qnn_params = tensor.Quantization()
             if tflite_qnn_params is not None:
+                qnn_params = dict()
                 scale = float(tflite_qnn_params.ScaleAsNumpy())
                 zero_point = int(tflite_qnn_params.ZeroPointAsNumpy())
+                min_v = float(tflite_qnn_params.MinAsNumpy())
+                max_v = float(tflite_qnn_params.MaxAsNumpy())
                 # Check that the scale and zero points are valid.
                 if scale != 0 or zero_point != 0:
-                    qnn_params = dict()
                     qnn_params['scale'] = scale
                     qnn_params['zero_point'] = zero_point
+                if min_v != 0 or max_v != 0:
+                    qnn_params['min'] = min_v
+                    qnn_params['max'] = max_v
             return_list.append(TensorWrapper(tensor_idx, tensor, buffer, c_type, qnn_params))
         return return_list
 
@@ -485,30 +568,6 @@ class OperatorConverter(object):
         raise NotImplementedError("Tensor type {} is currently not supported"
                                   .format(str(tensor_type)))
 
-    def has_same_qnn_params(self, lhs_tensor, rhs_tensor):
-        lhs_scale = lhs_tensor.qnn_params['scale']
-        rhs_scale = rhs_tensor.qnn_params['scale']
-        lhs_zero_point = lhs_tensor.qnn_params['zero_point']
-        rhs_zero_point = rhs_tensor.qnn_params['zero_point']
-        lhs_scale_value = lhs_scale
-        rhs_scale_value = rhs_scale
-        lhs_zero_point_value = lhs_zero_point
-        rhs_zero_point_value = rhs_zero_point
-        return lhs_scale_value == rhs_scale_value and \
-                lhs_zero_point_value == rhs_zero_point_value
-
-    def is_quantized(self, op):
-        """Check if an input tensor is quantized."""
-        try:
-            from tflite.Operator import Operator
-        except ImportError:
-            raise ImportError("The tflite package must be installed")
-
-        assert isinstance(op, Operator)
-        input_tensors = self.get_input_tensors(op)
-        first_tensor = input_tensors[0]
-        return first_tensor.qnn_params is not None
-
     def convert_conv2d(self, op):
         """Convert TFLite conv2d"""
         return self.convert_conv(op, "conv2d")
@@ -535,58 +594,25 @@ class OperatorConverter(object):
         assert len(input_tensors) >= 2, "input tensors length should be >= 2"
 
         weight_tensor = input_tensors[1]
-        weight_tensor_idx = weight_tensor.tensor_idx
 
-        # Constant nodes generation pass
-        if self.is_const:
-            # Stride const tensor
-            if conv_type == 'conv2d':
-                assert op.BuiltinOptionsType() == BuiltinOptions.Conv2DOptions
-                op_options = op.BuiltinOptions()
-                conv_options = Conv2DOptions()
-                conv_options.Init(op_options.Bytes, op_options.Pos)
-            elif conv_type == 'depthwise':
-                assert op.BuiltinOptionsType() == BuiltinOptions.DepthwiseConv2DOptions
-                op_options = op.BuiltinOptions()
-                conv_options = DepthwiseConv2DOptions()
-                conv_options.Init(op_options.Bytes, op_options.Pos)
-            else:
-                raise ValueError(
-                    'Operator {} is not supported for frontend TFLite.'.format(conv_type))
+        # weight tensor type should be UINT8 (quantization) or FLOAT32
+        weight_tensor_type = weight_tensor.tensor.Type()
+        assert weight_tensor_type in (TensorType.UINT8, TensorType.FLOAT32)
 
-            stride_h = conv_options.StrideH()
-            stride_w = conv_options.StrideW()
-            self.nn_stride(stride_h, stride_w)
+        # in_expr = self.get_expr(input_tensor_idx)
+        weight_value = self.get_tensor_value(weight_tensor)
 
-            # RELU6 consts value
-            fused_activation_fn = conv_options.FusedActivationFunction()
-            if fused_activation_fn == ActivationFunctionType.RELU6:
-                self.nn_scalar(6.0, ("float", 4))
+        # TFLite kernel layout:
+        # convolution:
+        # OC KH KW IC, we require KH KW IC OC (HWIO)
+        # depthwise convolution:
+        # 1 KH KW C(input_c * depth_multiplier), we require
+        # KH KW IC M (depth_multiplier) (HWOI)
+        weight_value = weight_value.transpose((1, 2, 3, 0))
+        weight_nodes = self.nn_new_const(weight_tensor, weight_value)
 
-            # weight tensor type should be UINT8 (quantization) or FLOAT32
-            weight_tensor_type = weight_tensor.tensor.Type()
-            assert weight_tensor_type in (TensorType.UINT8, TensorType.FLOAT32)
 
-            # in_expr = self.get_expr(input_tensor_idx)
-            weight_value = self.get_tensor_value(weight_tensor)
-
-            # TFLite kernel layout:
-            # convolution:
-            # OC KH KW IC, we require KH KW IC OC (HWIO)
-            # depthwise convolution:
-            # 1 KH KW C(input_c * depth_multiplier), we require
-            # KH KW IC M (depth_multiplier) (HWOI)
-            weight_value = weight_value.transpose((1, 2, 3, 0))
-            self.nn_new_const(weight_tensor, weight_value)
-
-            if len(input_tensors) == 3:
-                bias_tensor = input_tensors[2]
-                bias_tensor_type = bias_tensor.tensor.Type()
-                # bias tensor type should be INT32 (quantization) or FLOAT32
-                assert bias_tensor_type in (TensorType.INT32, TensorType.FLOAT32)
-                bias_value = self.get_tensor_value(bias_tensor)
-                self.nn_new_const(bias_tensor, bias_value)
-            return
+        #return
         # End of Constant nodes generation pass
 
         # Non-Constant nodes generation Pass
@@ -620,10 +646,9 @@ class OperatorConverter(object):
         stride_h = conv_options.StrideH()
         stride_w = conv_options.StrideW()
         stride_nodes = self.nn_stride(stride_h, stride_w)
+
         dilation_h = conv_options.DilationHFactor()
         dilation_w = conv_options.DilationWFactor()
-        padding = conv_options.Padding()
-        fused_activation_fn = conv_options.FusedActivationFunction()
 
         _, input_h, input_w, input_c = input_tensor.tensor.ShapeAsNumpy()
 
@@ -635,15 +660,11 @@ class OperatorConverter(object):
         else:
             output_channels, kernel_h, kernel_w, _ = weight_tensor.tensor.ShapeAsNumpy()
 
-        dilated_kernel_h = dilation_h * (kernel_h - 1) + 1
-        dilated_kernel_w = dilation_w * (kernel_w - 1) + 1
-
         params = {'kernel_size': [kernel_h, kernel_w],
                   'strides': [stride_h, stride_w],
                   'dilation': [dilation_h, dilation_w],
                   'padding': [0,0],
                   'data_layout': 'NHWC'}
-
 
 
         if input_tensor.qnn_params:
@@ -658,18 +679,32 @@ class OperatorConverter(object):
         if input_tensor_idx not in self.tensor_tab:
             raise ValueError("Can not find tensor_id {} in tensor_tab".format(input_tensor_idx))
         data_nodes = self.tensor_tab[input_tensor_idx]
-        weight_nodes = self.tensor_tab[weight_tensor_idx]
         conv_out_nodes = self.nn_conv2d(
             data_nodes, weight_nodes, stride_nodes, conv_options, output_tensor_shape, is_dw_conv)
         op_out_nodes = conv_out_nodes
         # if we have bias
         if len(input_tensors) == 3:
             bias_tensor = input_tensors[2]
-            bias_tensor_idx = bias_tensor.tensor_idx
-            bias_nodes = self.tensor_tab[bias_tensor_idx]
+            bias_tensor_type = bias_tensor.tensor.Type()
+            assert bias_tensor_type in (TensorType.INT32, TensorType.FLOAT32)
+            bias_value = self.get_tensor_value(bias_tensor)
+            bias_nodes = self.nn_new_const(bias_tensor, bias_value)
             bias_out_nodes = self.nn_bias_add(conv_out_nodes, bias_nodes, output_tensor_shape)
             op_out_nodes = bias_out_nodes
         # If we have fused activations
+        fused_activation_fn = conv_options.FusedActivationFunction()
+        if fused_activation_fn == ActivationFunctionType.NONE:
+            out_qnn = output_tensor.qnn_params
+            if out_qnn and 'min' in out_qnn and 'max' in out_qnn:
+                out_min_v = round(out_qnn['min'])
+                out_max_v = round(out_qnn['max'])
+                if out_min_v == 0 and out_max_v == 6:
+                    fused_activation_fn = ActivationFunctionType.RELU6
+                    print("Autodetect ActivationFunctionType as RELU6")
+                elif out_min_v == 0 and out_max_v == 1:
+                    fused_activation_fn = ActivationFunctionType.RELU
+                    print("Autodetect ActivationFunctionType as RELU")
+
         if fused_activation_fn != ActivationFunctionType.NONE:
             fused_act_out_nodes = self.nn_fused_activation(
                 op_out_nodes, fused_activation_fn, output_tensor_shape, output_tensor_c_type)
@@ -677,6 +712,43 @@ class OperatorConverter(object):
 
         self.tensor_tab[output_tensor_idx] = op_out_nodes
         return op_out_nodes
+
+
+    def convert_reshape(self, op):
+        """Convert TFLite reshape"""
+        try:
+            from tflite.BuiltinOptions import BuiltinOptions
+            from tflite.Operator import Operator
+            from tflite.ReshapeOptions import ReshapeOptions
+        except ImportError:
+            raise ImportError("The tflite package must be installed")
+
+        assert isinstance(op, Operator)
+        input_tensors = self.get_input_tensors(op)
+        assert input_tensors, "input tensors should not be empty"
+        input_tensor = input_tensors[0]
+        input_tensor_idx = input_tensor.tensor_idx
+        input_tensor_shape = input_tensor.tensor.ShapeAsNumpy()
+
+        output_tensors = self.get_output_tensors(op)
+        assert len(output_tensors) == 1, "output tensors length should be 1"
+        output_tensor = output_tensors[0]
+        output_tensor_idx = output_tensor.tensor_idx
+        output_tensor_shape = output_tensor.tensor.ShapeAsNumpy()
+        output_tensor_c_type = output_tensor.c_type
+
+        assert op.BuiltinOptionsType() == BuiltinOptions.ReshapeOptions
+        op_options = op.BuiltinOptions()
+        reshape_options = ReshapeOptions()
+        reshape_options.Init(op_options.Bytes, op_options.Pos)
+        target_shape = reshape_options.NewShapeAsNumpy()
+
+        data_nodes = self.tensor_tab[input_tensor_idx]
+
+        out_nodes = self.nn_reshape(data_nodes, input_tensor_shape, target_shape)
+
+        self.tensor_tab[output_tensor_idx] = out_nodes
+        return out_nodes
 
 
 def build_str_map(obj):
@@ -769,12 +841,15 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
     op_converter.define_model_sizes("IN", in_tensor)
     op_converter.define_model_sizes("OUT", out_tensor)
 
-    op_converter.is_const = True
-    op_converter.convert_op_to_hexagon_nn()
+    #op_converter.is_const = True
+    #op_converter.convert_op_to_hexagon_nn()
 
     op_converter.nn_add_input(in_tensor)
 
-    op_converter.is_const = False
+    print("tensor_tab:")
+    print(op_converter.tensor_tab)
+
+    op_converter.is_const = True
     output_nodes = op_converter.convert_op_to_hexagon_nn()
 
     op_converter.nn_add_output(output_nodes)
@@ -788,10 +863,10 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
 
 
 def main():
-    tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224_conv0.tflite")
+    tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224_quant_conv0.tflite")
     tflite_model_buf = open(tflite_model_file, "rb").read()
     model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
-    prog_name = "mn2"
+    prog_name = "qmn2"
     from_tflite(model, prog_name)
 
 
