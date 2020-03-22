@@ -55,6 +55,7 @@ class OperatorConverter(object):
             'DEPTHWISE_CONV_2D': self.convert_depthwise_conv2d,
             'RESHAPE': self.convert_reshape,
             'SOFTMAX': self.convert_softmax,
+            'AVERAGE_POOL_2D': self.convert_avgpool,
         }
 
     def __del__(self):
@@ -63,21 +64,42 @@ class OperatorConverter(object):
     def close(self):
         self.h_file.close()
 
-    def h(self, *args):
-        print(*args, file=self.h_file)
+    def h(self, *args, **kwargs):
+        print(*args, **kwargs, file=self.h_file)
+
+    def hArray(self, arr):
+        i = 0
+        for v in arr:
+            if i > 0 and i % 8 == 0:
+                self.h("")
+            self.h(v, end = ',')
+            i += 1
+        self.h("")
 
     def print_nn_nodes(self):
-        self.h("void append_const_nodes(nn_id) {")
+        self.h("void append_const_nodes(hexagon_nn_nn_id nn_id) {")
         for node in self.const_nodes:
             self.h("   ", node)
         self.h("}")
         self.h("")
 
-        self.h("void append_nodes(nn_id) {")
+        self.h("void append_nodes(hexagon_nn_nn_id nn_id) {")
         for node in self.nodes:
             self.h("   ", node)
         self.h("}")
         self.h("")
+
+    def shape_to_4d(self, shape):
+        assert shape.size in [2, 3, 4], "Tensor shape size should be 2, 3 or 4"
+        if shape.size == 2:
+            n, c = shape
+            h = w = 1
+        elif shape.size == 3:
+            n, w, c = shape
+            h = 1
+        else:
+            n,h,w,c = shape
+        return n,h,w,c
 
     def get_min_max(self, tensor):
         ctype, type_bytes = tensor.c_type
@@ -87,6 +109,7 @@ class OperatorConverter(object):
         zero_point = int(qnn_params.ZeroPointAsNumpy())
         is_uint8 = ctype == "uint8_t"
         if is_uint8:
+            print("scale:", scale)
             min_v = -zero_point * scale
             max_v = (255 - zero_point) * scale
         else:
@@ -157,7 +180,7 @@ class OperatorConverter(object):
 
         # Data
         self.h("static {} data_for_op_{}[{}] ALIGNED = {{".format(ctype, n_id, flat_v.size))
-        self.h("", np.array2string(flat_v, separator=",")[1:-1])
+        self.hArray(flat_v)
         self.h("};")
         self.h("")
 
@@ -176,7 +199,7 @@ class OperatorConverter(object):
         return out_nodes
 
     def define_model_sizes(self, prefix, tensor):
-        n,h,w,c = tensor.tensor.ShapeAsNumpy()
+        n,h,w,c = self.shape_to_4d(tensor.tensor.ShapeAsNumpy())
         _, type_bytes = tensor.c_type
         if self.is_dequantize and prefix == "OUT":
             type_bytes = 4
@@ -296,7 +319,7 @@ class OperatorConverter(object):
             self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(node[0], node[1]))
         self.h("};")
         # prep_output_arr
-        n, h, w, c = data_shape
+        n, h, w, c = self.shape_to_4d(data_shape)
         self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
         self.h("    OUTPUT_4D({},{},{},{},4),".format(n, h, w, c))
         self.h("};")
@@ -471,27 +494,30 @@ class OperatorConverter(object):
             return data_nodes
         raise ValueError("Reshape is not implemented yet")
 
-    def nn_softmax(self, data_nodes, data_shape):
-        in_len = out_len = len(data_nodes)
-        assert in_len in [1, 3], "Softmax data_nodes size should be 1 or 3"
+    def nn_softmax(self, data_nodes, beta_nodes, data_shape):
+        assert len(data_nodes) in [1, 3], "Softmax data_nodes size should be 1 or 3"
         self.node_id += 1
         n_id = self.node_id
         f_name = "OP_Softmax_f"
         type_bytes = 4
-        is_quant = in_len == 3
+        is_quant = len(data_nodes) == 3
         if is_quant:
             f_name = "OP_QuantizedSoftmax_8"
             type_bytes = 1
 
         # prep_input_arr
+        in_len = out_len = len(data_nodes)
         self.h("// Softmax")
         self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
         for data_node in data_nodes:
             self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_node[0], data_node[1]))
+        if beta_nodes is not None:
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(beta_nodes[0][0], beta_nodes[0][1]))
+            in_len += 1
         self.h("};")
 
         # prep_output_arr
-        n, h, w, c = data_shape
+        n, h, w, c = self.shape_to_4d(data_shape)
         self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
         self.h("    OUTPUT_4D({},{},{},{},{}),".format(n, h, w, c, type_bytes))
         if is_quant:
@@ -503,6 +529,44 @@ class OperatorConverter(object):
         self.nodes.append(
             "APPEND_NODE(\"softmax\",{nid},{f_name},NN_PAD_NA,inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
             .format(nid=n_id, f_name=f_name, in_len=in_len, out_len=out_len)
+        )
+        out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
+        return out_nodes
+
+    def nn_avgpool(self, data_nodes, filter_nodes, stride_nodes, output_shape):
+        assert len(data_nodes) in [1, 3], "Softmax data_nodes size should be 1 or 3"
+        in_len = len(data_nodes) + 2
+        out_len = len(data_nodes)
+        self.node_id += 1
+        n_id = self.node_id
+        f_name = "OP_AvgPool_f"
+        type_bytes = 4
+        is_quant = len(data_nodes) == 3
+        if is_quant:
+            f_name = "OP_QuantizedAvgPool_8"
+            type_bytes = 1
+        # prep_input_arr
+        self.h("// AvgPool")
+        self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        for data_node in data_nodes:
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_node[0], data_node[1]))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(filter_nodes[0][0], filter_nodes[0][1]))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(stride_nodes[0][0], stride_nodes[0][1]))
+        self.h("};")
+
+        # prep_output_arr
+        n, h, w, c = output_shape
+        self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        self.h("    OUTPUT_4D({},{},{},{},{}),".format(n, h, w, c, type_bytes))
+        if is_quant:
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+        self.h("};")
+        self.h("")
+
+        self.nodes.append(
+            "APPEND_NODE(\"avgpool\",{nid},{f_name},NN_PAD_NA,inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
+                .format(nid=n_id, f_name=f_name, in_len=in_len, out_len=out_len)
         )
         out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
@@ -716,6 +780,7 @@ class OperatorConverter(object):
 
         dilation_h = conv_options.DilationHFactor()
         dilation_w = conv_options.DilationWFactor()
+        assert (dilation_h, dilation_w) == (1, 1), "Currently Convolution only supports Dilation 1x1"
 
         _, input_h, input_w, input_c = input_tensor.tensor.ShapeAsNumpy()
 
@@ -753,7 +818,6 @@ class OperatorConverter(object):
         else:
             op_out_nodes = self.nn_fused_activation(
                 op_out_nodes, fused_activation_fn, output_tensor_shape, output_tensor.c_type)
-
 
         self.tensor_tab[output_tensor_idx] = op_out_nodes
         return op_out_nodes
@@ -795,7 +859,9 @@ class OperatorConverter(object):
     def convert_softmax(self, op):
         """Convert TFLite softmax"""
         try:
+            from tflite.BuiltinOptions import BuiltinOptions
             from tflite.Operator import Operator
+            from tflite.SoftmaxOptions import SoftmaxOptions
         except ImportError:
             raise ImportError("The tflite package must be installed")
 
@@ -812,9 +878,63 @@ class OperatorConverter(object):
         output_tensor_idx = output_tensor.tensor_idx
         output_tensor_shape = output_tensor.tensor.ShapeAsNumpy()
 
+        assert op.BuiltinOptionsType() == BuiltinOptions.SoftmaxOptions
+        op_options = op.BuiltinOptions()
+        softmax_options = SoftmaxOptions()
+        softmax_options.Init(op_options.Bytes, op_options.Pos)
+        beta = softmax_options.Beta()
+        data_nodes = self.tensor_tab[input_tensor_idx]
+        beta_nodes = None
+        if beta != 1.0:
+            beta_nodes = self.nn_scalar(beta, ("float", 4))
+
+        out_nodes = self.nn_softmax(data_nodes, beta_nodes, output_tensor_shape)
+
+        self.tensor_tab[output_tensor_idx] = out_nodes
+        return out_nodes
+
+    def convert_avgpool(self, op):
+        """Convert TFLite avgpool"""
+        try:
+            from tflite.BuiltinOptions import BuiltinOptions
+            from tflite.ActivationFunctionType import ActivationFunctionType
+            from tflite.Operator import Operator
+            from tflite.Pool2DOptions import Pool2DOptions
+            from tflite.Padding import Padding
+        except ImportError:
+            raise ImportError("The tflite package must be installed")
+
+        assert isinstance(op, Operator)
+        input_tensors = self.get_input_tensors(op)
+        assert len(input_tensors) == 1, "input tensors length should be 1"
+        input_tensor = input_tensors[0]
+        input_tensor_idx = input_tensor.tensor_idx
+
+        output_tensors = self.get_output_tensors(op)
+        assert len(output_tensors) == 1, "output tensors should be 1"
+        output_tensor = output_tensors[0]
+        output_tensor_idx = output_tensor.tensor_idx
+        output_tensor_shape = output_tensor.tensor.ShapeAsNumpy()
+
+        assert op.BuiltinOptionsType() == BuiltinOptions.Pool2DOptions
+        op_options = op.BuiltinOptions()
+        pool2d_options = Pool2DOptions()
+        pool2d_options.Init(op_options.Bytes, op_options.Pos)
+        padding = pool2d_options.Padding()
+        assert padding == Padding.VALID, "Currently AvgPool only supports VALID padding"
+        fused_activation_fn = pool2d_options.FusedActivationFunction()
+        assert fused_activation_fn == ActivationFunctionType.NONE, "AvgPool does not support Activation Functions yet"
+        filter_h = pool2d_options.FilterHeight()
+        filter_w = pool2d_options.FilterWidth()
+        stride_h = pool2d_options.StrideH()
+        stride_w = pool2d_options.StrideW()
+
+        stride_nodes = self.nn_stride(stride_h, stride_w)
+        filter_nodes = self.nn_stride(filter_h, filter_w)
+
         data_nodes = self.tensor_tab[input_tensor_idx]
 
-        out_nodes = self.nn_softmax(data_nodes, output_tensor_shape)
+        out_nodes = self.nn_avgpool(data_nodes, filter_nodes, stride_nodes, output_tensor_shape)
 
         self.tensor_tab[output_tensor_idx] = out_nodes
         return out_nodes
@@ -926,7 +1046,7 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
 
 
 def main():
-    tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224_conv1.tflite")
+    tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224_quant.tflite")
     tflite_model_buf = open(tflite_model_file, "rb").read()
     model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
     prog_name = "qmn2"
