@@ -35,7 +35,10 @@ in_t = graph.get_tensor_by_name("input:0")
 #out_t = graph.get_tensor_by_name("MobilenetV1/MobilenetV1/Conv2d_0/add_fold:0")
 #out_t = graph.get_tensor_by_name("MobilenetV1/MobilenetV1/Conv2d_0/act_quant/FakeQuantWithMinMaxVars:0")
 #out_t = graph.get_tensor_by_name("MobilenetV1/MobilenetV1/Conv2d_0/Relu6:0")
-out_t = graph.get_tensor_by_name("MobilenetV1/MobilenetV1/Conv2d_1_depthwise/Relu6:0")
+#out_t = graph.get_tensor_by_name("MobilenetV1/MobilenetV1/Conv2d_1_depthwise/Relu6:0")
+#out_t = graph.get_tensor_by_name("MobilenetV1/MobilenetV1/Conv2d_13_pointwise/Relu6:0")
+#out_t = graph.get_tensor_by_name("MobilenetV1/Logits/AvgPool_1a/AvgPool:0")
+out_t = graph.get_tensor_by_name("MobilenetV1/Predictions/Reshape_1:0")
 
 
 
@@ -59,4 +62,8 @@ print("Got input:", img.flatten()[0:4])
 print("Got output:", res.flatten()[0:10])
 
 
-
+for i in range(0,1000):
+    v = res[0][i]
+    if (v > 0.2):
+        print("{}:{}".format(i, v), end=", ")
+print("")

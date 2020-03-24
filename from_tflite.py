@@ -77,13 +77,11 @@ class OperatorConverter(object):
         self.h("")
 
     def print_nn_nodes(self):
-        self.h("void append_const_nodes(hexagon_nn_nn_id nn_id) {")
+        self.h("void init_graph(int nn_id) {")
         for node in self.const_nodes:
             self.h("   ", node)
-        self.h("}")
         self.h("")
 
-        self.h("void append_nodes(hexagon_nn_nn_id nn_id) {")
         for node in self.nodes:
             self.h("   ", node)
         self.h("}")
@@ -313,7 +311,7 @@ class OperatorConverter(object):
         n_id = self.node_id
 
         # prep_input_arr
-        self.h("// Requantize")
+        self.h("// Dequantize")
         self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
         for node in data_nodes:
             self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(node[0], node[1]))
@@ -375,14 +373,14 @@ class OperatorConverter(object):
         out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
 
-    def nn_conv2d(self, data_nodes, weight_nodes, stride_nodes, conv_options, output_shape, is_dw):
+    def nn_conv2d(self, data_nodes, weight_nodes, stride_nodes, padding, output_shape, is_dw):
         self.node_id += 1
         n_id = self.node_id
         is_quant = len(data_nodes) == 3
 
-        padding = "NN_PAD_VALID"
-        if conv_options.Padding() == Padding.SAME:
-            padding = "NN_PAD_SAME"
+        padding_str = "NN_PAD_VALID"
+        if padding == Padding.SAME:
+            padding_str = "NN_PAD_SAME"
 
         op_name = "OP_Conv2d_f"
         n_name = "conv2d"
@@ -422,7 +420,7 @@ class OperatorConverter(object):
 
         self.nodes.append(
             "APPEND_NODE(\"{n_name}\",{n_id},{op_name},{padding},inputs_for_{n_id},{in_len},outputs_for_{n_id},{out_len});".format(
-                n_name=n_name, n_id=n_id, op_name=op_name, padding=padding, in_len=in_len, out_len=out_len
+                n_name=n_name, n_id=n_id, op_name=op_name, padding=padding_str, in_len=in_len, out_len=out_len
             )
         )
 
@@ -533,7 +531,7 @@ class OperatorConverter(object):
         out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
 
-    def nn_avgpool(self, data_nodes, filter_nodes, stride_nodes, output_shape):
+    def nn_avgpool(self, data_nodes, filter_nodes, stride_nodes, padding, output_shape):
         assert len(data_nodes) in [1, 3], "Softmax data_nodes size should be 1 or 3"
         in_len = len(data_nodes) + 2
         out_len = len(data_nodes)
@@ -545,6 +543,9 @@ class OperatorConverter(object):
         if is_quant:
             f_name = "OP_QuantizedAvgPool_8"
             type_bytes = 1
+        padding = "NN_PAD_VALID"
+        if padding == Padding.SAME:
+            padding = "NN_PAD_SAME"
         # prep_input_arr
         self.h("// AvgPool")
         self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
@@ -565,8 +566,8 @@ class OperatorConverter(object):
         self.h("")
 
         self.nodes.append(
-            "APPEND_NODE(\"avgpool\",{nid},{f_name},NN_PAD_NA,inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
-                .format(nid=n_id, f_name=f_name, in_len=in_len, out_len=out_len)
+            "APPEND_NODE(\"avgpool\",{nid},{f_name},{padding},inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
+                .format(nid=n_id, f_name=f_name, padding=padding, in_len=in_len, out_len=out_len)
         )
         out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
@@ -782,6 +783,7 @@ class OperatorConverter(object):
         dilation_w = conv_options.DilationWFactor()
         assert (dilation_h, dilation_w) == (1, 1), "Currently Convolution only supports Dilation 1x1"
 
+        padding = conv_options.Padding()
         _, input_h, input_w, input_c = input_tensor.tensor.ShapeAsNumpy()
 
         if is_dw_conv:
@@ -796,7 +798,7 @@ class OperatorConverter(object):
             raise ValueError("Can not find tensor_id {} in tensor_tab".format(input_tensor_idx))
         data_nodes = self.tensor_tab[input_tensor_idx]
         conv_out_nodes = self.nn_conv2d(
-            data_nodes, weight_nodes, stride_nodes, conv_options, output_tensor_shape, is_dw_conv)
+            data_nodes, weight_nodes, stride_nodes, padding, output_tensor_shape, is_dw_conv)
         op_out_nodes = conv_out_nodes
         # if we have bias
         if len(input_tensors) == 3:
@@ -921,7 +923,6 @@ class OperatorConverter(object):
         pool2d_options = Pool2DOptions()
         pool2d_options.Init(op_options.Bytes, op_options.Pos)
         padding = pool2d_options.Padding()
-        assert padding == Padding.VALID, "Currently AvgPool only supports VALID padding"
         fused_activation_fn = pool2d_options.FusedActivationFunction()
         assert fused_activation_fn == ActivationFunctionType.NONE, "AvgPool does not support Activation Functions yet"
         filter_h = pool2d_options.FilterHeight()
@@ -934,7 +935,7 @@ class OperatorConverter(object):
 
         data_nodes = self.tensor_tab[input_tensor_idx]
 
-        out_nodes = self.nn_avgpool(data_nodes, filter_nodes, stride_nodes, output_tensor_shape)
+        out_nodes = self.nn_avgpool(data_nodes, filter_nodes, stride_nodes, padding, output_tensor_shape)
 
         self.tensor_tab[output_tensor_idx] = out_nodes
         return out_nodes
@@ -1046,10 +1047,10 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
 
 
 def main():
-    tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224_quant.tflite")
+    tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224.tflite")
     tflite_model_buf = open(tflite_model_file, "rb").read()
     model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
-    prog_name = "qmn2"
+    prog_name = "mn2"
     from_tflite(model, prog_name)
 
 
