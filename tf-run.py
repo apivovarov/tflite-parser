@@ -62,7 +62,7 @@ print("Got input:", img.flatten()[0:4])
 print("Got output:", res.flatten()[0:10])
 
 
-for i in range(0,1000):
+for i in range(0,1001):
     v = res[0][i]
     if (v > 0.2):
         print("{}:{}".format(i, v), end=", ")

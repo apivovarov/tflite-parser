@@ -25,7 +25,7 @@ img /= 255.0
 
 print(img.shape)
 
-model = "../models/mobilenet_v1_0.75_224_quant_frozen.pb"
+model = "../models/mobilenet_v2_1.0_224_quant_frozen.pb"
 
 graph = load_frozen_graph(model)
 
@@ -37,7 +37,9 @@ in_t = graph.get_tensor_by_name("input:0")
 #out_t = graph.get_tensor_by_name("MobilenetV1/MobilenetV1/Conv2d_0/Relu6:0")
 #out_t = graph.get_tensor_by_name("MobilenetV1/MobilenetV1/Conv2d_1_depthwise/Relu6:0")
 #out_t = graph.get_tensor_by_name("MobilenetV1/MobilenetV1/Conv2d_13_pointwise/Relu6:0")
-out_t = graph.get_tensor_by_name("MobilenetV1/Logits/AvgPool_1a/AvgPool:0")
+out_t = graph.get_tensor_by_name("MobilenetV2/Logits/output:0")
+#out_t = graph.get_tensor_by_name("MobilenetV2/expanded_conv_1/project/add_fold:0") #24 - 1019 - 56,56,24
+#out_t = graph.get_tensor_by_name("MobilenetV2/expanded_conv_2/add:0") #101 - 1028 - 56,56,24
 
 
 
@@ -57,5 +59,10 @@ print(res.shape)
 
 print("--------------------")
 print("Got input:", img.flatten()[0:4])
-print("Got output:", res.flatten()[0:10])
+print("Got output:", res.flatten()[0:20])
 
+# for i in range(0,1001):
+#     v = res[0][i]
+#     if (v > 10):
+#         print("{}:{}".format(i, v), end=", ")
+# print("")

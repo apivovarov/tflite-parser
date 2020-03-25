@@ -4,7 +4,7 @@ import tflite.Model
 import tflite.BuiltinOperator
 import numpy as np
 import os
-tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224_quant_conv1.tflite")
+tflite_model_file = os.path.join("../models/", "mobilenet_v2_1.0_224_quant.tflite")
 tflite_model_buf = open(tflite_model_file, "rb").read()
 model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
 np.set_printoptions(threshold=100000, linewidth=100)
@@ -106,15 +106,15 @@ def print_weight(id):
 
 subgraph = model.Subgraphs(0)
 
-print_data(id=6)
-print_weight(id=2)
-print_bias(id=0)
+#print_data(id=6)
+#print_weight(id=2)
+#print_bias(id=0)
 
-print_data(id=1)
-print_weight(id=5)
-print_bias(id=4)
+#print_data(id=1)
+#print_weight(id=5)
+#print_bias(id=4)
 
-print_data(id=3)
+#print_data(id=3)
 
 import tensorflow.lite as lite
 
@@ -143,25 +143,35 @@ print("OUTPUT");
 #    for w in range(20,25):
 #        pos = 112 * 24 * h + 24 * w
 #        print(res[pos:pos + 10])
-row = list()
-rid = 0
-for i in range(0, 112*112*24):
-    if i%24 == 0:
-        row.append(res[i]*0.023528477177023888)
-        if len(row) == 112:
-            print(rid, ":", min(row), max(row))
-            row = list()
-            rid +=1
+
+# row = list()
+# rid = 0
+# for i in range(0, 112*112*24):
+#     if i%24 == 0:
+#         row.append(res[i]*0.023528477177023888)
+#         if len(row) == 112:
+#             print(rid, ":", min(row), max(row))
+#             row = list()
+#             rid +=1
 
 
 print("--------------------")
 
 
-res_f = list()
-for v in res[0:10]:
-    res_f.append(0.023528477177023888*v)
+#res_f = 0.098893*(res-50)
+from scipy.special import softmax
+#res_f = softmax(res_f)
 
 print("Got input:", img.flatten()[0:4])
 print("Got output:", res[0:10])
 print("Got output:", res[-10:])
-print("Got output f32:", res_f)
+#print("Got output f32:", res_f)
+from scipy.special import softmax
+
+
+print("max", np.max(res))
+print("min", np.min(res))
+for i in range(0,1000):
+    v = res[i]
+    if (v > 140):
+        print("{}:{}".format(i, v), end=", ")

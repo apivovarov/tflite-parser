@@ -56,6 +56,8 @@ class OperatorConverter(object):
             'RESHAPE': self.convert_reshape,
             'SOFTMAX': self.convert_softmax,
             'AVERAGE_POOL_2D': self.convert_avgpool,
+            'ADD': self.convert_add,
+            'MUL': self.convert_mul,
         }
 
     def __del__(self):
@@ -572,6 +574,56 @@ class OperatorConverter(object):
         out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
 
+    def nn_elemwise(self, lhs_nodes, rhs_nodes, op_type, output_shape):
+        in_len = len(lhs_nodes) * 2
+        out_len = len(lhs_nodes)
+        is_quant = len(lhs_nodes) == 3
+        type_bytes = 4
+        if is_quant:
+            type_bytes = 1
+            if op_type == "Add":
+                f_name = "OP_QuantizedAdd_8p8to8"
+            elif op_type == "Mul":
+                f_name = "OP_QuantizedMul_8x8to8"
+            else:
+                raise ValueError("op_type {} is not supported yet".format(op_type))
+        else:
+            if op_type == "Add":
+                f_name = "OP_Add_f"
+            elif op_type == "Mul":
+                f_name = "OP_Mul_f"
+            else:
+                raise ValueError("op_type {} is not supported yet".format(op_type))
+        self.node_id += 1
+        n_id = self.node_id
+        # prep_input_arr
+        self.h("//", op_type)
+        self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(lhs_nodes[0][0], lhs_nodes[0][1]))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(rhs_nodes[0][0], rhs_nodes[0][1]))
+        if is_quant:
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(lhs_nodes[1][0], lhs_nodes[1][1]))
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(lhs_nodes[2][0], lhs_nodes[2][1]))
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(rhs_nodes[1][0], rhs_nodes[1][1]))
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(rhs_nodes[2][0], rhs_nodes[2][1]))
+        self.h("};")
+
+        # prep_output_arr
+        n, h, w, c = output_shape
+        self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        self.h("    OUTPUT_4D({},{},{},{},{}),".format(n, h, w, c, type_bytes))
+        if is_quant:
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+        self.h("};")
+        self.h("")
+
+        self.nodes.append(
+            "APPEND_NODE(\"{op_type}\",{nid},{f_name},NN_PAD_NA,inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
+                .format(op_type=op_type, nid=n_id, f_name=f_name, in_len=in_len, out_len=out_len)
+        )
+        out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
+        return out_nodes
 
     def check_unsupported_ops(self):
         """Check unsupported TFLite ops in our converter."""
@@ -941,6 +993,84 @@ class OperatorConverter(object):
         return out_nodes
 
 
+    def convert_elemwise(self, op):
+        """Generic method to Convert TFLite elemwise"""
+        try:
+            from tflite.Operator import Operator
+            from tflite.AddOptions import AddOptions
+            from tflite.SubOptions import SubOptions
+            from tflite.MulOptions import MulOptions
+            from tflite.DivOptions import DivOptions
+            from tflite.BuiltinOptions import BuiltinOptions
+            from tflite.ActivationFunctionType import ActivationFunctionType
+        except ImportError:
+            raise ImportError("The tflite package must be installed")
+
+        assert isinstance(op, Operator)
+        input_tensors = self.get_input_tensors(op)
+        assert len(input_tensors) == 2, "input tensors length should be 2"
+
+        def get_input_nodes(tensor):
+            if tensor.tensor_idx in self.tensor_tab:
+                # In most cases, we can assume that TOCO fuses elemwise operators
+                # with constants - it means both will be tensors.
+                return self.tensor_tab[tensor.tensor_idx]
+            else:
+                # However, in some corner cases, the elemwise operator is not fused,
+                # we can receive as constant.
+                t_value = self.get_tensor_value(tensor)
+                return self.nn_new_const(tensor, t_value)
+
+        lhs_nodes = get_input_nodes(input_tensors[0])
+        rhs_nodes = get_input_nodes(input_tensors[1])
+
+        assert len(lhs_nodes) in [1, 3], "Nodes list size should be 1 or 3"
+        assert len(lhs_nodes) == len(rhs_nodes), "Left and right nodes list size should be equal"
+
+        output_tensors = self.get_output_tensors(op)
+        assert len(output_tensors) == 1, "output tensors length should be 1"
+        output_tensor = output_tensors[0]
+        output_tensor_idx = output_tensor.tensor_idx
+        output_tensor_shape = output_tensor.tensor.ShapeAsNumpy()
+
+        # Options (fused_activation_function)
+        options = None
+        if op.BuiltinOptionsType() == BuiltinOptions.AddOptions:
+            op_type = "Add"
+            options = AddOptions()
+        elif op.BuiltinOptionsType() == BuiltinOptions.SubOptions:
+            op_type = "Sub"
+            options = SubOptions()
+        elif op.BuiltinOptionsType() == BuiltinOptions.MulOptions:
+            op_type = "Mul"
+            options = MulOptions()
+        elif op.BuiltinOptionsType() == BuiltinOptions.DivOptions:
+            op_type = "Div"
+            options = DivOptions()
+
+        if options is not None:
+            op_options = op.BuiltinOptions()
+            options.Init(op_options.Bytes, op_options.Pos)
+            fused_activation_fn = options.FusedActivationFunction()
+            # if we have activation fn
+            assert fused_activation_fn == ActivationFunctionType.NONE, \
+                'Elemwise operators with fused activation are not supported yet.'
+
+        out_nodes = self.nn_elemwise(lhs_nodes, rhs_nodes, op_type, output_tensor_shape)
+
+        self.tensor_tab[output_tensor_idx] = out_nodes
+        return out_nodes
+
+    def convert_add(self, op):
+        """Convert TFLite ADD"""
+        return self.convert_elemwise(op)
+
+    def convert_mul(self, op):
+        """Convert TFLite MULL"""
+        return self.convert_elemwise(op)
+# end of class OperatorConverter
+
+
 def build_str_map(obj):
     """Build string map of TFLite enum int value
 
@@ -1023,7 +1153,7 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
 
     # op code in model
     op_converter = OperatorConverter(model, subgraph, prog_name)
-    op_converter.is_dequantize = True
+    op_converter.is_dequantize = False
     op_converter.check_unsupported_ops()
 
     in_tensor = op_converter.get_tensors(model_inputs)[0]
@@ -1047,10 +1177,10 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
 
 
 def main():
-    tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224.tflite")
+    tflite_model_file = os.path.join("../models/", "mobilenet_v2_1.0_224_quant.tflite")
     tflite_model_buf = open(tflite_model_file, "rb").read()
     model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
-    prog_name = "mn2"
+    prog_name = "qmn2"
     from_tflite(model, prog_name)
 
 

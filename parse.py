@@ -4,7 +4,7 @@ import tflite.Model
 import tflite.BuiltinOperator
 import numpy as np
 import os
-tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224_conv1.tflite")
+tflite_model_file = os.path.join("../models/", "mobilenet_v2_0.75_224.tflite")
 tflite_model_buf = open(tflite_model_file, "rb").read()
 model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
 np.set_printoptions(threshold=100000, precision=12, linewidth=160, floatmode='fixed')
@@ -170,15 +170,15 @@ print("OUTPUT");
 #        pos = 112 * 24 * h + 24 * w
 #        print(res[pos:pos + 10])
 
-row = list()
-rid = 0
-for i in range(0, 112*112*24):
-    if i%24 == 0:
-        row.append(res[i])
-        if len(row) == 112:
-            print(rid, ":", min(row), max(row))
-            row = list()
-            rid +=1
+# row = list()
+# rid = 0
+# for i in range(0, 112*112*24):
+#     if i%24 == 0:
+#         row.append(res[i])
+#         if len(row) == 112:
+#             print(rid, ":", min(row), max(row))
+#             row = list()
+#             rid +=1
 
 print("--------------------")
 
@@ -186,3 +186,7 @@ print("--------------------")
 print("Got input:", img.flatten()[0:4])
 print("Got output:", res[0:10])
 
+for i in range(0,1000):
+    v = res[i]
+    if (v > 0.2):
+        print("{}:{}".format(i, v), end=", ")
