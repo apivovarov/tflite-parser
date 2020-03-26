@@ -36,7 +36,7 @@ class OperatorConverter(object):
         self.subgraph = subgraph
         self.tensor_tab = {}
         self.stride_tab = {}
-        self.float_tab = {}
+        self.scalar_tab = {}
         self.const_nodes = []
         self.nodes = []
         self.builtin_op_code = build_str_map(BuiltinOperator())
@@ -56,8 +56,10 @@ class OperatorConverter(object):
             'RESHAPE': self.convert_reshape,
             'SOFTMAX': self.convert_softmax,
             'AVERAGE_POOL_2D': self.convert_avgpool,
+            'MAX_POOL_2D': self.convert_maxpool,
             'ADD': self.convert_add,
             'MUL': self.convert_mul,
+            'CONCATENATION': self.convert_concat,
         }
 
     def __del__(self):
@@ -118,13 +120,13 @@ class OperatorConverter(object):
         return min_v, max_v
 
     def nn_scalar(self, v, c_type):
-        key = v
-        if key in self.float_tab:
-            print("Float, already exist:", self.float_tab[key])
-            return self.float_tab[key]
+        ctype, type_bytes = c_type
+        key = (v, ctype)
+        if key in self.scalar_tab:
+            print("Float, already exist:", self.scalar_tab[key])
+            return self.scalar_tab[key]
         self.const_node_id += 1
         n_id = self.const_node_id
-        ctype, type_bytes = c_type
 
         self.h("static {} data_for_op_{}[1] ALIGNED = {{".format(ctype, n_id))
         self.h("", v)
@@ -137,7 +139,7 @@ class OperatorConverter(object):
 
         print("Added Number, id:", self.const_node_id, ", v:", v)
         out_nodes = [(n_id, 0)]
-        self.float_tab[key] = out_nodes
+        self.scalar_tab[key] = out_nodes
         return out_nodes
 
     def nn_stride(self, h, w):
@@ -533,23 +535,24 @@ class OperatorConverter(object):
         out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
 
-    def nn_avgpool(self, data_nodes, filter_nodes, stride_nodes, padding, output_shape):
+    def nn_pool(self, op_type, data_nodes, filter_nodes, stride_nodes, padding, output_shape):
+        assert op_type in ["Avg", "Max"], "op_type should be Avg or Max"
         assert len(data_nodes) in [1, 3], "Softmax data_nodes size should be 1 or 3"
         in_len = len(data_nodes) + 2
         out_len = len(data_nodes)
         self.node_id += 1
         n_id = self.node_id
-        f_name = "OP_AvgPool_f"
+        f_name = "OP_{}Pool_f".format(op_type)
         type_bytes = 4
         is_quant = len(data_nodes) == 3
         if is_quant:
-            f_name = "OP_QuantizedAvgPool_8"
+            f_name = "OP_Quantized{}Pool_8".format(op_type)
             type_bytes = 1
-        padding = "NN_PAD_VALID"
+        padding_str = "NN_PAD_VALID"
         if padding == Padding.SAME:
-            padding = "NN_PAD_SAME"
+            padding_str = "NN_PAD_SAME"
         # prep_input_arr
-        self.h("// AvgPool")
+        self.h("// {}Pool".format(op_type))
         self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
         for data_node in data_nodes:
             self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_node[0], data_node[1]))
@@ -566,10 +569,10 @@ class OperatorConverter(object):
             self.h("    OUTPUT_4D(1,1,1,1,4),")
         self.h("};")
         self.h("")
-
+        nname = "{}pool".format(op_type).lower()
         self.nodes.append(
-            "APPEND_NODE(\"avgpool\",{nid},{f_name},{padding},inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
-                .format(nid=n_id, f_name=f_name, padding=padding, in_len=in_len, out_len=out_len)
+            "APPEND_NODE(\"{nname}\",{nid},{f_name},{padding},inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
+            .format(nname=nname, nid=n_id, f_name=f_name, padding=padding_str, in_len=in_len, out_len=out_len)
         )
         out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
@@ -625,6 +628,55 @@ class OperatorConverter(object):
         out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
         return out_nodes
 
+    def nn_concat(self, dim, data_nodes_arr, output_shape):
+        assert len(data_nodes_arr) > 1, "It should be 2 or more tensors to concatenate"
+        d_len = len(data_nodes_arr)
+        is_quant = len(data_nodes_arr[0]) == 3
+        type_bytes = 4
+        f_name = "OP_Concat_f"
+        in_len = d_len + 1
+        out_len = 1
+        if is_quant:
+            assert dim == 3, "Quantized Concat only supports depth dimension (dim=3)"
+            type_bytes = 1
+            f_name = "OP_QuantizedConcat_8"
+            in_len = d_len * 3 + 1
+            out_len = 3
+
+        dim_nodes = self.nn_scalar(dim, ("int32_t", 4))
+
+        self.node_id += 1
+        n_id = self.node_id
+        # prep_input_arr
+        self.h("// Concat")
+        self.h("static hexagon_nn_input inputs_for_{}[] = {{".format(n_id))
+        self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(dim_nodes[0][0], dim_nodes[0][1]))
+        for data_nodes in data_nodes_arr:
+            self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[0][0], data_nodes[0][1]))
+        if is_quant:
+            for data_nodes in data_nodes_arr:
+                self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[1][0], data_nodes[1][1]))
+            for data_nodes in data_nodes_arr:
+                self.h("    {{ .src_id = {}, .output_idx = {}, }},".format(data_nodes[2][0], data_nodes[2][1]))
+        self.h("};")
+
+        # prep_output_arr
+        n, h, w, c = output_shape
+        self.h("static hexagon_nn_output outputs_for_{}[] = {{".format(n_id))
+        self.h("    OUTPUT_4D({},{},{},{},{}),".format(n, h, w, c, type_bytes))
+        if is_quant:
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+            self.h("    OUTPUT_4D(1,1,1,1,4),")
+        self.h("};")
+        self.h("")
+
+        self.nodes.append(
+            "APPEND_NODE(\"concat\",{nid},{f_name},NN_PAD_NA,inputs_for_{nid},{in_len},outputs_for_{nid},{out_len});"
+                .format(nid=n_id, f_name=f_name, in_len=in_len, out_len=out_len)
+        )
+        out_nodes = list(map(lambda i: (n_id, i), range(0, out_len)))
+        return out_nodes
+
     def check_unsupported_ops(self):
         """Check unsupported TFLite ops in our converter."""
         unsupported_ops_set = set()
@@ -641,7 +693,6 @@ class OperatorConverter(object):
             ops = str(list(unsupported_ops_set)).strip('[,]')
             raise ValueError(msg.format(ops))
 
-
     def convert_op_to_hexagon_nn(self):
         """Convert TFLite ops to hexagon_nn"""
         for op_idx in range(self.subgraph.OperatorsLength()):
@@ -656,7 +707,6 @@ class OperatorConverter(object):
             ret = self.nn_dequantize(ret, out_shape)
         assert len(output_tensors) == 1, "Last Operator should have one output tensor"
         return ret
-
 
     def get_op_code_str(self, op):
         """Get TFLite ops string representation"""
@@ -784,22 +834,6 @@ class OperatorConverter(object):
         weight_tensor_type = weight_tensor.tensor.Type()
         assert weight_tensor_type in (TensorType.UINT8, TensorType.FLOAT32)
 
-        # in_expr = self.get_expr(input_tensor_idx)
-        weight_value = self.get_tensor_value(weight_tensor)
-
-        # TFLite kernel layout:
-        # convolution:
-        # OC KH KW IC, we require KH KW IC OC (HWIO)
-        # depthwise convolution:
-        # 1 KH KW C(input_c * depth_multiplier), we require
-        # KH KW IC M (depth_multiplier) (HWOI)
-        weight_value = weight_value.transpose((1, 2, 3, 0))
-        weight_nodes = self.nn_new_const(weight_tensor, weight_value)
-
-
-        #return
-        # End of Constant nodes generation pass
-
         # Non-Constant nodes generation Pass
         input_tensor = input_tensors[0]
         input_tensor_idx = input_tensor.tensor_idx
@@ -838,13 +872,24 @@ class OperatorConverter(object):
         padding = conv_options.Padding()
         _, input_h, input_w, input_c = input_tensor.tensor.ShapeAsNumpy()
 
+        # in_expr = self.get_expr(input_tensor_idx)
+        weight_value = self.get_tensor_value(weight_tensor)
         if is_dw_conv:
-            # TFLite depthwise convolution kernel layout is:
-            # 1 KH KW C(input_c * depth_multiplier)
-            _, kernel_h, kernel_w, in_channels = weight_tensor.tensor.ShapeAsNumpy()
-            assert in_channels == input_c * depth_multiplier
+            # Depthwise convolution kernel layout:
+            # TFLite:      1 KH KW OC (OC = input_c * depth_multiplier)
+            # Hexagon_NN: KH KW IC M (M - depth_multiplier)
+            kb, kh, kw, kc = weight_tensor.tensor.ShapeAsNumpy()
+            assert kb == 1, "Depthwise kernel batch dim should be 1"
+            assert kc == input_c * depth_multiplier, "Depthwise kernel_c should be input_c * depth_multiplier"
+            weight_value = weight_value.reshape(kh, kw, input_c, depth_multiplier)
         else:
+            # convolution kernel layout:
+            # TFLite:     OC KH KW IC (OHWI)
+            # Hexagon_NN: KH KW IC OC (HWIO)
+            weight_value = weight_value.transpose((1, 2, 3, 0))
             output_channels, kernel_h, kernel_w, _ = weight_tensor.tensor.ShapeAsNumpy()
+
+        weight_nodes = self.nn_new_const(weight_tensor, weight_value)
 
         if input_tensor_idx not in self.tensor_tab:
             raise ValueError("Can not find tensor_id {} in tensor_tab".format(input_tensor_idx))
@@ -947,8 +992,7 @@ class OperatorConverter(object):
         self.tensor_tab[output_tensor_idx] = out_nodes
         return out_nodes
 
-    def convert_avgpool(self, op):
-        """Convert TFLite avgpool"""
+    def convert_pool(self, op_type, op):
         try:
             from tflite.BuiltinOptions import BuiltinOptions
             from tflite.ActivationFunctionType import ActivationFunctionType
@@ -976,7 +1020,7 @@ class OperatorConverter(object):
         pool2d_options.Init(op_options.Bytes, op_options.Pos)
         padding = pool2d_options.Padding()
         fused_activation_fn = pool2d_options.FusedActivationFunction()
-        assert fused_activation_fn == ActivationFunctionType.NONE, "AvgPool does not support Activation Functions yet"
+        assert fused_activation_fn == ActivationFunctionType.NONE, "Pool does not support Activation Functions yet"
         filter_h = pool2d_options.FilterHeight()
         filter_w = pool2d_options.FilterWidth()
         stride_h = pool2d_options.StrideH()
@@ -987,11 +1031,18 @@ class OperatorConverter(object):
 
         data_nodes = self.tensor_tab[input_tensor_idx]
 
-        out_nodes = self.nn_avgpool(data_nodes, filter_nodes, stride_nodes, padding, output_tensor_shape)
+        out_nodes = self.nn_pool(op_type, data_nodes, filter_nodes, stride_nodes, padding, output_tensor_shape)
 
         self.tensor_tab[output_tensor_idx] = out_nodes
         return out_nodes
 
+    def convert_avgpool(self, op):
+        """Convert TFLite avgpool"""
+        return self.convert_pool("Avg", op)
+
+    def convert_maxpool(self, op):
+        """Convert TFLite maxpool"""
+        return self.convert_pool("Max", op)
 
     def convert_elemwise(self, op):
         """Generic method to Convert TFLite elemwise"""
@@ -1068,6 +1119,42 @@ class OperatorConverter(object):
     def convert_mul(self, op):
         """Convert TFLite MULL"""
         return self.convert_elemwise(op)
+
+    def convert_concat(self, op):
+        """Generic method to Convert TFLite concat"""
+        try:
+            from tflite.Operator import Operator
+            from tflite.ConcatenationOptions import ConcatenationOptions
+            from tflite.BuiltinOptions import BuiltinOptions
+            from tflite.ActivationFunctionType import ActivationFunctionType
+        except ImportError:
+            raise ImportError("The tflite package must be installed")
+
+        assert isinstance(op, Operator)
+        input_tensors = self.get_input_tensors(op)
+        assert len(input_tensors) > 1, "input tensors length should be greater than 1"
+
+        data_nodes = [self.tensor_tab[t.tensor_idx] for t in input_tensors]
+
+        output_tensors = self.get_output_tensors(op)
+        assert len(output_tensors) == 1, "output tensors length should be 1"
+        output_tensor = output_tensors[0]
+        output_tensor_idx = output_tensor.tensor_idx
+        output_tensor_shape = output_tensor.tensor.ShapeAsNumpy()
+
+        assert op.BuiltinOptionsType() == BuiltinOptions.ConcatenationOptions
+        op_options = op.BuiltinOptions()
+        concat_options = ConcatenationOptions()
+        concat_options.Init(op_options.Bytes, op_options.Pos)
+        concat_dim = concat_options.Axis()
+        fused_activation_fn = concat_options.FusedActivationFunction()
+        assert fused_activation_fn == ActivationFunctionType.NONE, \
+            'Concat operator with fused activation is not supported yet.'
+
+        out_nodes = self.nn_concat(concat_dim, data_nodes, output_tensor_shape)
+
+        self.tensor_tab[output_tensor_idx] = out_nodes
+        return out_nodes
 # end of class OperatorConverter
 
 
@@ -1177,10 +1264,13 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
 
 
 def main():
-    tflite_model_file = os.path.join("../models/", "mobilenet_v2_1.0_224_quant.tflite")
+    m = "mobilenet_v1_0.75_224_quant_conv1.tflite"
+    m = "iv1_quant.tflite"
+    m = "iv2_quant.tflite"
+    tflite_model_file = os.path.join("../models/", m)
     tflite_model_buf = open(tflite_model_file, "rb").read()
     model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
-    prog_name = "qmn2"
+    prog_name = "qiv2"
     from_tflite(model, prog_name)
 
 
