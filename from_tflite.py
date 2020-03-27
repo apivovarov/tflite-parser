@@ -20,7 +20,7 @@ class TensorWrapper(object):
 
 class OperatorConverter(object):
     const_node_id = 0
-    node_id = 1000
+    node_id = 10000
 
     """OperatorConverter class which handles TFLite ops to Hexagon NN ops conversion"""
     def __init__(self, model, subgraph, prog_name):
@@ -81,7 +81,7 @@ class OperatorConverter(object):
         self.h("")
 
     def print_nn_nodes(self):
-        self.h("void init_graph(int nn_id) {")
+        self.h("void dlr_hexagon_init_graph(int nn_id) {")
         for node in self.const_nodes:
             self.h("   ", node)
         self.h("")
@@ -1265,12 +1265,11 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
 
 def main():
     m = "mobilenet_v1_0.75_224_quant_conv1.tflite"
-    m = "iv1_quant.tflite"
-    m = "iv2_quant.tflite"
+    m = "iv3_quant.tflite"
     tflite_model_file = os.path.join("../models/", m)
     tflite_model_buf = open(tflite_model_file, "rb").read()
     model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
-    prog_name = "qiv2"
+    prog_name = "qiv3"
     from_tflite(model, prog_name)
 
 

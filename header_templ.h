@@ -1,5 +1,5 @@
 #include <hexagon_nn.h>
-#include "../interface/hexagon_nn_ops.h"
+#include "hexagon_nn_ops.h"
 #include "sdk_fastrpc.h"
 
 void info_for_debug(unsigned int id, const char *name, const char *opname) {
@@ -20,4 +20,5 @@ void info_for_debug(unsigned int id, const char *name, const char *opname) {
                 goto TEARDOWN; \
         }
 
+void dlr_hexagon_init_graph(int nn_id);
 
