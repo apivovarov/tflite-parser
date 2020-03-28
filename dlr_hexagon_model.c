@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "qiv1.h"
+#include "qmn2_v1.h"
 
 int dlr_hexagon_model_init(int* graph_id_ptr, uint8_t** input, uint8_t** output, int debug_level) {
     int err = 0;
@@ -103,4 +103,8 @@ void dlr_hexagon_model_close(int graph_id) {
 
     // Stop fastRPC
     fastrpc_teardown();
+}
+
+int dlr_hexagon_nn_getlog(int graph_id, unsigned char* buff, int sz) {
+  return hexagon_nn_getlog(graph_id, buff, sz);
 }
