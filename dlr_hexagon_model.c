@@ -2,8 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <hexagon_nn.h>
-#include <hexagon_nn_ops.h>
-#include <sdk_fastrpc.h>
+#include "hexagon_nn_ops.h"
+#include "sdk_fastrpc.h"
 
 #include "dlr_hexagon_model.h"
 

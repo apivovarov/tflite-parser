@@ -16,7 +16,7 @@ static long long ns();
 static size_t read_img(const char *path, uint8_t *img, size_t sz);
 static void* dlr_find_symbol(void* handle, const char* fn_name);
 static void print_hexagon_nn_log(int graph_id, char* buff);
-
+static int argmax(uint8_t* output, int sz);
 
 int main() {
     const char* model = "/data/local/tmp/vendor/lib64/dlr_hexagon_model.so";
@@ -50,21 +50,28 @@ int main() {
 
     read_img("/data/local/tmp/vendor/bin/cat224-3.txt", input, 224*224*3);
 
-    err = (*dlr_hexagon_model_exec)(graph_id, input, output);
-    if (err != 0) {
-      printf("dlr_hexagon_model_exec failed %d\n", err);
-      print_hexagon_nn_log(graph_id, buff);
-      return err;
-    }
-    float mx = 0;
+    int N = 250;
+    float totalT = 0.0;
     int mx_id = 0;
-    for(int i=0; i < 1001; i++) {
-        if (output[i] > mx) {
-            mx = output[i];
-            mx_id = i;
+    for (int n = -1; n < N; n++) {
+        long long t1 = ns();
+        err = (*dlr_hexagon_model_exec)(graph_id, input, output);
+        if (err != 0) {
+            printf("dlr_hexagon_model_exec failed %d\n", err);
+            print_hexagon_nn_log(graph_id, buff);
+            return err;
         }
+        if (n == -1) {
+           mx_id = argmax(output, 1001);
+           print_hexagon_nn_log(graph_id, buff);
+        }
+        long long t2 = ns();
+        float tt = (t2-t1)/1000.0;
+        if (n > -1)
+          totalT += tt;
+        printf("%d: OUTPUT: %d:%d, time: %.3f\n", n, mx_id, output[mx_id], tt);
     }
-    printf("Max: [%d]=%.3f\n", mx_id, mx);
+    printf("AVG Time: %.3f\n", totalT/N);
 
     (*dlr_hexagon_model_close)(graph_id);
     input = NULL;
@@ -123,4 +130,17 @@ static void print_hexagon_nn_log(int graph_id, char* buff) {
     if (err == 0) {
       puts(buff);
     }
+}
+
+static int argmax(uint8_t* output, int sz) {
+    uint8_t mx = 0;
+    int mx_id = 0;
+    for(int i=0; i < sz; i++) {
+        if (output[i] > mx) {
+            mx = output[i];
+            mx_id = i;
+        }
+    }
+    printf("Max: [%d]=%d\n", mx_id, mx);
+    return mx_id;
 }
