@@ -1,8 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <hexagon_nn.h>
+#include <hexagon_nn_ops.h>
+#include <sdk_fastrpc.h>
 
-#include "qmn2_v1.h"
+#include "dlr_hexagon_model.h"
+
 
 int dlr_hexagon_model_init(int* graph_id_ptr, uint8_t** input, uint8_t** output, int debug_level) {
     int err = 0;

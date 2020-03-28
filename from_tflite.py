@@ -1264,12 +1264,12 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
 
 
 def main():
-    m = "mobilenet_v1_0.75_224_quant_conv1.tflite"
-    m = "iv3_quant.tflite"
+    m = "mobilenet_v1_0.75_224_quant.tflite"
+    #m = "iv3_quant.tflite"
     tflite_model_file = os.path.join("../models/", m)
     tflite_model_buf = open(tflite_model_file, "rb").read()
     model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
-    prog_name = "qiv3"
+    prog_name = "dlr_hexagon_model"
     from_tflite(model, prog_name)
 
 
