@@ -11,6 +11,8 @@ int (*dlr_hexagon_model_init)(int*, uint8_t**, uint8_t**, int);
 int (*dlr_hexagon_model_exec)(int, uint8_t*, uint8_t*);
 void (*dlr_hexagon_model_close)(int);
 int (*dlr_hexagon_nn_getlog)(int, unsigned char*, int);
+int (*dlr_hexagon_input_spec)(int, char**, int*, int**, int*, int*);
+int (*dlr_hexagon_output_spec)(int, char**, int*, int**, int*, int*);
 
 static long long ns();
 static size_t read_img(const char *path, uint8_t *img, size_t sz);
@@ -29,7 +31,9 @@ int main() {
     dlr_hexagon_model_init = dlr_find_symbol(handle, "dlr_hexagon_model_init");
     dlr_hexagon_model_exec = dlr_find_symbol(handle, "dlr_hexagon_model_exec");
     dlr_hexagon_model_close = dlr_find_symbol(handle, "dlr_hexagon_model_close");
-    dlr_hexagon_nn_getlog = dlr_find_symbol(handle, "hexagon_nn_getlog");
+    dlr_hexagon_nn_getlog = dlr_find_symbol(handle, "dlr_hexagon_nn_getlog");
+    dlr_hexagon_input_spec = dlr_find_symbol(handle, "dlr_hexagon_input_spec");
+    dlr_hexagon_output_spec = dlr_find_symbol(handle, "dlr_hexagon_output_spec");
     int graph_id = 0;
     uint8_t* input = NULL;
     uint8_t* output = NULL;
