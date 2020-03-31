@@ -207,7 +207,8 @@ class OperatorConverter(object):
             type_bytes = 4
 
         self.h("//", prefix, "SIZE")
-        self.h("#define {}_NAME {}".format(prefix, tensor.tensor.Name()))
+        self.h("char* {}_name = \"{}\"".format(prefix.lower(), tensor.tensor.Name().decode("utf-8")))
+        self.h("int* {}_shape = {{{}, {}, {}, {}}}".format(prefix.lower(), n, h, w, c))
         self.h("#define {}_BATCH {}".format(prefix, n))
         self.h("#define {}_HEIGHT {}".format(prefix, h))
         self.h("#define {}_WIDTH {}".format(prefix, w))

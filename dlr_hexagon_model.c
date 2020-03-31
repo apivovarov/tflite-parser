@@ -9,14 +9,9 @@
 
 int dlr_hexagon_input_spec(int id, char** name, int* dim, int** shape_, int* length, int* bytes) {
   if (id != 0) return -1;
-  *name = strcpy((char*) malloc(strlen(IN_NAME) + 1), IN_NAME)
+  *name = in_name;
   *dim = 4;
-  int* shape = (int*) malloc(4 * sizeof(int));
-  shape[0] = IN_BATCH;
-  shape[1] = IN_HEIGHT;
-  shape[2] = IN_WIDTH;
-  shape[3] = IN_DEPTH;
-  *shape_ = shape
+  *shape_ = in_shape;
   *length = IN_LEN;
   *bytes =  IN_SIZE;
   return 0;
@@ -24,14 +19,9 @@ int dlr_hexagon_input_spec(int id, char** name, int* dim, int** shape_, int* len
 
 int dlr_hexagon_output_spec(int id, char** name, int* dim, int** shape_, int* length, int* bytes) {
   if (id != 0) return -1;
-  *name = strcpy((char*) malloc(strlen(OUT_NAME) + 1), IN_NAME)
+  *name = out_name;
   *dim = 4;
-  int* shape = (int*) malloc(4 * sizeof(int));
-  shape[0] = OUT_BATCH;
-  shape[1] = OUT_HEIGHT;
-  shape[2] = OUT_WIDTH;
-  shape[3] = OUT_DEPTH;
-  *shape_ = shape
+  *shape_ = out_shape;
   *length = OUT_LEN;
   *bytes =  OUT_SIZE;
   return 0;
