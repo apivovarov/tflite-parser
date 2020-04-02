@@ -71,3 +71,20 @@ sm8250
 rennell
 saipan
 ```
+
+# Appendix B - Supported models
+Hexagon converter supports almost all quantized TFLite models from [tfhub](https://tfhub.dev/)
+such as Mobilenet v1, v2 and Inception v1, v2, v3 (except of v4).
+
+List of supported ops:
+```
+CONV_2D
+DEPTHWISE_CONV_2D
+RESHAPE
+SOFTMAX
+AVERAGE_POOL_2D
+MAX_POOL_2D
+ADD
+MUL
+CONCATENATION
+```
