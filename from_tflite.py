@@ -1,10 +1,11 @@
+#!/usr/bin/env python3
 """Tensorflow lite to hexagon_nn converter"""
 import numpy as np
 import tflite.Model
 from tflite.ActivationFunctionType import ActivationFunctionType
 from tflite.Padding import Padding
-import os
 import shutil
+import sys
 
 np.set_printoptions(threshold=100000000, linewidth=160)
 
@@ -207,8 +208,8 @@ class OperatorConverter(object):
             type_bytes = 4
 
         self.h("//", prefix, "SIZE")
-        self.h("char* {}_name = \"{}\"".format(prefix.lower(), tensor.tensor.Name().decode("utf-8")))
-        self.h("int* {}_shape = {{{}, {}, {}, {}}}".format(prefix.lower(), n, h, w, c))
+        self.h("char* {}_name = \"{}\";".format(prefix.lower(), tensor.tensor.Name().decode("utf-8")))
+        self.h("int {}_shape[4] = {{{}, {}, {}, {}}};".format(prefix.lower(), n, h, w, c))
         self.h("#define {}_BATCH {}".format(prefix, n))
         self.h("#define {}_HEIGHT {}".format(prefix, h))
         self.h("#define {}_WIDTH {}".format(prefix, w))
@@ -1233,13 +1234,6 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
     assert model_inputs.size == 1, "Model should have only one input"
     assert model_outputs.size == 1, "Model should have only one output"
 
-    #for model_input in model_inputs:
-    #     nn_add_input(model_input)
-    #     model_input_name = get_tensor_name(subgraph, model_input)
-    #     shape = shape_dict[model_input_name] if model_input_name in shape_dict else None
-    #     dtype = dtype_dict[model_input_name] if model_input_name in dtype_dict else "float32"
-    #     #exp_tab.set_expr(model_input_name, _expr.var(model_input_name, shape=shape, dtype=dtype))
-
     # op code in model
     op_converter = OperatorConverter(model, subgraph, prog_name)
     op_converter.is_dequantize = False
@@ -1263,16 +1257,19 @@ def from_tflite(model, prog_name): #, shape_dict, dtype_dict):
     print(op_converter.tensor_tab)
 
     op_converter.close()
+    print("Converted Hexagon Model saved to {}".format(op_converter.h_file.name))
 
 
 def main():
-    m = "mobilenet_v1_0.75_224_quant.tflite"
-    #m = "iv3_quant.tflite"
-    tflite_model_file = os.path.join("../models/", m)
-    tflite_model_buf = open(tflite_model_file, "rb").read()
-    model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
-    prog_name = "dlr_hexagon_model"
-    from_tflite(model, prog_name)
+    if len (sys.argv) != 2:
+        print("Usage: ./from_tflite.py <tflite_file>")
+        sys.exit (1)
+    tflite_model_file = sys.argv[1]
+    with open(tflite_model_file, "rb") as f:
+        tflite_model_buf = f.read()
+        model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
+        prog_name = "dlr_hexagon_model"
+        from_tflite(model, prog_name)
 
 
 if __name__== "__main__":

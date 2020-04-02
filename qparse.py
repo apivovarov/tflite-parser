@@ -4,7 +4,7 @@ import tflite.Model
 import tflite.BuiltinOperator
 import numpy as np
 import os
-tflite_model_file = os.path.join("../models/", "iv2_quant.tflite")
+tflite_model_file = os.path.join("../models/", "mobilenet_v1_0.75_224_quant.tflite")
 tflite_model_buf = open(tflite_model_file, "rb").read()
 model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
 np.set_printoptions(threshold=100000, linewidth=100)
@@ -173,5 +173,5 @@ print("max", np.max(res))
 print("min", np.min(res))
 for i in range(0,1000):
     v = res[i]
-    if (v > 120):
+    if (v > 77):
         print("{}:{}".format(i, v), end=", ")
